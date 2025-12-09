@@ -1,0 +1,137 @@
+# FSLogix Profile Manager – Changelog
+
+## v0.5.2 (rev2)  – GitHub/About button & UI polish
+
+- Added a **GitHub/About button** in the top-right corner of the main window:
+  - Clicking the button opens: `https://github.com/packetloss404`.
+  - The button attempts to render a small embedded GitHub icon.
+  - If the icon cannot be loaded (e.g., GDI+/image decode issues), it falls back to a small text label **“GH”** instead of throwing an error.
+
+- Kept the bottom-row alignment and wording from v0.5.2:
+  - Bottom controls (status label, ODFC/Profile checkboxes, Reset/Close buttons) arranged on a single horizontal row.
+  - Main action button text: **“Reset Profile”**.
+  - Confirmation dialog clearly indicates that containers will be renamed to `*-old.vhd(x)`.
+
+---
+
+## v0.5.2  (Profile-only & ODFC-only targeting, “Reset Profile” UI)
+
+- Added a new **“Only Profile containers”** checkbox, alongside:
+  - **“Only ODFC (Office) containers”**
+
+- The tool now supports three clear retirement/reset modes:
+  1. **ODFC-only**:
+     - `Only ODFC (Office) containers` checked.
+     - `Only Profile containers` unchecked.
+     - Only containers whose filenames match `odfc` or `office` are renamed.
+  2. **Profile-only**:
+     - `Only Profile containers` checked.
+     - `Only ODFC (Office) containers` unchecked.
+     - Only non-ODFC containers (typical user profile VHD/VHDX) are renamed.
+  3. **All containers**:
+     - Both checkboxes unchecked.
+     - All containers for the selected users are renamed.
+
+- Ensured the two checkboxes are **mutually exclusive**:
+  - Checking one automatically unchecks the other.
+  - If both are true at the function level, no action is taken and a warning is logged.
+
+- UI alignment and labeling:
+  - Bottom-row controls (status label, ODFC/Profile checkboxes, Reset/Close buttons) are aligned in a single horizontal row for a cleaner look.
+  - Main action button text changed from “Retire (rename) selected” to **“Reset Profile”**.
+  - Confirmation dialog updated to match the new wording and still clearly indicate that containers will be renamed to `*-old.vhd(x)`.
+
+- Under the hood:
+  - `Rename-FSLogixProfileObject` now accepts `-OnlyOdfc` and `-OnlyProfile` switches.
+  - Filters the profile’s `ContainerFiles` collection based on these flags.
+  - Logs the final container list that will be processed (or skipped).
+
+---
+
+## v0.5.1  (Rename-based “retire” behavior)
+
+- Changed cleanup semantics from **delete** to **rename**:
+  - Instead of deleting FSLogix containers, the tool now **renames** them by appending `-old` before the extension.
+  - Examples:
+    - `Profile_username_SID.vhdx` → `Profile_username_SID-old.vhdx`
+    - `ODFC_username_SID.vhd` → `ODFC_username_SID-old.vhd`
+  - This provides a safer rollback path and avoids immediate data loss.
+
+- Updated per-user operation:
+  - New core function `Rename-FSLogixProfileObject` replaces the delete function.
+  - Logs are now written as `FSLogix_Rename_username_YYYYMMDDHHMMSS.log`.
+
+- Updated UI labels:
+  - Bottom action button text changed to “Retire (rename) selected”.
+  - Checkbox text for Office-only mode changed to “Only ODFC (Office) containers”.
+  - Confirmation dialog explicitly states files will be renamed to `*-old.vhd(x)`.
+
+- WhatIf behavior:
+  - When **WhatIf (simulate)** is enabled, the tool logs what would be renamed without making changes.
+  - Log entries use messages like:
+    - `WHATIF: Would rename <oldPath> -> <newPath>`.
+
+---
+
+## v0.5  (FSLogix Horizon IC-focused build)
+
+- Added **versioning**:
+  - Script-level `$appVersion` variable set to `0.5`.
+  - Version string displayed in the window title.
+  - Version label displayed on the top row.
+
+- Stabilized discovery logic for environments using folder naming:
+  - `username_S-1-5-21-XXXXXXXXX-XXXXXXXXX-XXXXXXXXX-XXXXX`
+- Enumerates all `*.vhd` / `*.vhdx` containers under the profile root and groups them by username.
+- Shows per-user aggregates:
+  - Container count
+  - Profile size (GB)
+  - Office/ODFC size (GB)
+  - Total size (GB)
+  - Last write time
+  - Root folder
+
+- Added **Delete only ODFC** mode (now evolved to Office-only rename/reset mode).
+- Maintained **WhatIf (simulate)** mode:
+  - On by default.
+  - Log files record what would be done instead of actually performing actions when enabled.
+
+- Implemented **row highlighting**:
+  - **Highlight > X GB** controls:
+    - Checkbox to enable/disable highlighting.
+    - Numeric threshold in GB.
+  - Rows where `TotalSizeGB >= threshold` are highlighted (MistyRose background).
+
+- Manual DataGridView population:
+  - Grid is populated row-by-row using stored profile objects in `Row.Tag`.
+  - Avoids data-binding quirks and ensures reliable display even with complex objects.
+
+- UI layout refinements:
+  - Controls placed on two clean top rows:
+    - Row 1: Profile Root, Load Profiles, version label.
+    - Row 2: Filter, Last used > X days, WhatIf (simulate), Highlight > X GB.
+  - NumericUpDown controls positioned to avoid clipping by the form edge.
+  - Bottom row: Status, container targeting toggles, main action button, Close.
+
+---
+
+## Planned for v0.6 (not yet implemented)
+
+- Optional **SID column** or per-folder breakdown:
+  - Show which SIDs/folders are aggregated per user.
+- **CSV export**:
+  - Export the current grid (with filters applied) to CSV for reporting.
+- **Per-column sorting**:
+  - Enable clicking on grid headers to sort by username, size, last write, etc.
+- **Multi-root / Cloud Cache support**:
+  - Allow specifying multiple FSLogix roots and merging results.
+- **Advanced delete/rename preview**:
+  - A dialog to review the exact rename plan (old → new paths) before confirming.
+- **Open-handle detection**:
+  - Attempt to detect in-use containers and warn before renaming.
+- **Theming**:
+  - Light/dark mode presets or basic color customization.
+- **Logging panel inside the UI**:
+  - Embedded view of recent log lines, with per-user operation summaries.
+- **Manual rescan button**:
+  - Explicit UI control to rescan the FSLogix roots without restarting the tool.
