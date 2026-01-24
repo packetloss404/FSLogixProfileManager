@@ -1,5 +1,51 @@
 # FSLogix Profile Manager – Changelog
 
+## v0.7.0
+
+Health monitoring update. The tool now catches problems before they bite you.
+
+**VHD health checks** – Scans for corrupt profiles (files with "CORRUPT" in the name), empty/broken containers, and already-retired files. Shows up in the new Status column.
+
+**Disk space monitoring** – Grid now shows "Used GB" vs "Max GB" columns. Profiles approaching their size limit (90%+) get flagged as NEAR_LIMIT and highlighted orange.
+
+**Orphan detection** – Enable "Check AD" before loading to find profiles for users that no longer exist in Active Directory. Uses ADSI queries so no AD module needed. Results cached per session.
+
+**Status column** – New column shows health status: OK, CORRUPT, ORPHAN, NEAR_LIMIT, EMPTY, RETIRED. Color-coded rows make problems obvious.
+
+**Issues only filter** – New checkbox to show only profiles with problems. Useful for cleanup sessions.
+
+**Legend** – Added a color legend in the toolbar so you know what the highlights mean.
+
+Window a bit wider (1200px) to fit everything.
+
+---
+
+## v0.6.0
+
+Big update. Finally got around to the features I've been putting off.
+
+**Multi-root support** – You can now specify multiple profile paths separated by semicolons. Handy for Cloud Cache setups where you've got profiles spread across servers. Results get merged by username.
+
+**SID column** – Grid now shows which SIDs are associated with each user. Hover for the full list if there's more than a couple.
+
+**CSV export** – Export button dumps the current filtered view to CSV.
+
+**Column sorting** – Click headers to sort. Click again to reverse.
+
+**Rename preview** – Before any rename operation, you get a dialog showing exactly what's about to happen. Shows which files are in-use or already have a `-old` version.
+
+**Open-handle detection** – New "Skip in-use" checkbox (on by default). Tries to detect if a VHD is mounted before renaming. Not bulletproof on network shares but better than nothing.
+
+**Theming** – Light/dark mode toggle. The dark theme is easier on the eyes for late-night cleanups.
+
+**Log panel** – Resizable panel at the bottom shows what's happening in real-time. Beats digging through %TEMP% for log files.
+
+**Rescan button** – Refresh the profile list without restarting the tool.
+
+Window is bigger now (1100x800) to fit everything.
+
+---
+
 ## v0.5.2 (rev2)  – GitHub/About button & UI polish
 
 - Added a **GitHub/About button** in the top-right corner of the main window:
@@ -115,23 +161,11 @@
 
 ---
 
-## Planned for v0.6 (not yet implemented)
+## Maybe someday
 
-- Optional **SID column** or per-folder breakdown:
-  - Show which SIDs/folders are aggregated per user.
-- **CSV export**:
-  - Export the current grid (with filters applied) to CSV for reporting.
-- **Per-column sorting**:
-  - Enable clicking on grid headers to sort by username, size, last write, etc.
-- **Multi-root / Cloud Cache support**:
-  - Allow specifying multiple FSLogix roots and merging results.
-- **Advanced delete/rename preview**:
-  - A dialog to review the exact rename plan (old → new paths) before confirming.
-- **Open-handle detection**:
-  - Attempt to detect in-use containers and warn before renaming.
-- **Theming**:
-  - Light/dark mode presets or basic color customization.
-- **Logging panel inside the UI**:
-  - Embedded view of recent log lines, with per-user operation summaries.
-- **Manual rescan button**:
-  - Explicit UI control to rescan the FSLogix roots without restarting the tool.
+- Scheduled/automated renames
+- Custom rename patterns (something other than `-old`)
+- Undo/restore (rename back from `-old`)
+- Keyboard shortcuts
+- VHD compaction (reclaim whitespace)
+- VHD repair (run chkdsk/Repair-Volume on containers)

@@ -8,7 +8,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ### Environment Assumptions
 
-- FSLogix containers stored under a UNC path (default: `\\fml-fslogix\FSLogixUserProfiles`)
+- FSLogix containers stored under UNC paths (supports multiple semicolon-separated paths for Cloud Cache)
+- Default: `\\fml-fslogix\FSLogixUserProfiles`
 - Folder naming pattern: `username_S-1-5-21-XXXXXXXXX-XXXXXXXXX-XXXXXXXXX-XXXXX`
 - Container files: `*.vhd` and `*.vhdx` files
 
@@ -26,95 +27,145 @@ powershell.exe -STA -ExecutionPolicy Bypass -File .\FSLogixProfileGUI.ps1
 
 The tool defaults to WhatIf mode (simulate) which is **enabled by default**. This logs what would happen without making actual changes. Always test with WhatIf first.
 
-Log files are written to `%TEMP%` with pattern: `FSLogix_Rename_username_YYYYMMDDHHMMSS.log`
+Log files are written to:
+- `%TEMP%` with pattern: `FSLogix_Rename_username_YYYYMMDDHHMMSS.log`
+- Embedded log panel in the UI (real-time)
 
 ## Architecture
 
 ### Core Functions
 
-1. **`Get-FSLogixProfiles`** (lines 30-113)
-   - Recursively scans the profile root for `*.vhd/*.vhdx` files
-   - Extracts usernames from folder names using regex pattern: `^(?<user>.+?)_S-1-5-21-`
-   - Aggregates multiple containers per user (Profile, ODFC/Office, multiple SIDs)
-   - Returns custom objects with: UserName, ContainerCount, ProfileSizeGB, OfficeSizeGB, TotalSizeGB, LastWriteTime, RootFolder, ContainerFiles array
+1. **`Get-FSLogixProfiles`** (lines 132-238)
+   - Accepts array of profile roots (supports multi-root/Cloud Cache)
+   - Recursively scans each root for `*.vhd/*.vhdx` files
+   - Extracts usernames AND SIDs from folder names using regex: `^(?<user>.+?)_(?<sid>S-1-5-21-[\d-]+)`
+   - Aggregates multiple containers per user across all roots
+   - Returns custom objects with: UserName, ContainerCount, ProfileSizeGB, OfficeSizeGB, TotalSizeGB, LastWriteTime, RootFolder, ContainerFiles array, SIDs (HashSet), ProfileRoots (HashSet)
    - Classification: Files matching `odfc|office` are Office containers, others are Profile containers
 
-2. **`Rename-FSLogixProfileObject`** (lines 118-198)
+2. **`Rename-FSLogixProfileObject`** (lines 243-338)
    - Core rename/retire operation with per-user logging
-   - Supports three modes via switches: `-OnlyOdfc`, `-OnlyProfile`, or both unchecked (all containers)
-   - Renames containers by appending `-old` before extension (e.g., `Profile_user_SID.vhdx` → `Profile_user_SID-old.vhdx`)
+   - Supports modes via switches: `-OnlyOdfc`, `-OnlyProfile`, `-CheckInUse`
+   - Open-handle detection: skips in-use files when `-CheckInUse` is true
+   - Renames containers by appending `-old` before extension
    - WhatIf support: logs `WHATIF: Would rename...` without actual changes
-   - Skips files that don't exist or where target already exists
+   - Logs to both file and embedded UI log panel
    - Returns log file path
 
-3. **`Apply-Filters`** (lines 203-227)
+3. **`Apply-Filters`** (lines 343-367)
    - Filters profile list by username substring match
    - Optional age filter: LastWriteTime < (Now - AgeDays)
    - Returns filtered array
 
-4. **`Update-RowHighlight`** (lines 232-259)
+4. **`Update-RowHighlight`** (lines 372-400)
    - Highlights DataGridView rows where TotalSizeGB >= threshold
-   - Uses MistyRose background color for highlighted rows
+   - Theme-aware: uses MistyRose for light theme, dark red for dark theme
+
+5. **`Export-GridToCSV`** (lines 405-433)
+   - Exports current grid contents to CSV file
+   - Proper escaping for CSV format
+
+6. **`Show-RenamePreviewDialog`** (lines 438-544)
+   - Modal dialog showing all files to be renamed
+   - Columns: User, Current Path, New Path, Status
+   - Color-coded status: OK (white), IN USE (red), EXISTS/MISSING (yellow)
+   - Returns DialogResult (OK to proceed, Cancel to abort)
+
+7. **`Apply-Theme`** (lines 549-629)
+   - Applies Light or Dark theme to all UI controls
+   - Recursively updates form, grid, buttons, text boxes, log panel
+   - Updates highlight colors per theme
+
+8. **`Test-FileInUse`** (lines 100-115)
+   - Attempts exclusive file open to detect if VHD/VHDX is mounted
+   - Returns $true if file is locked, $false if available
+
+9. **`Add-LogMessage`** (lines 72-95)
+   - Adds timestamped message to embedded log panel
+   - Supports log levels: INFO, WARN, ERROR
+   - Maintains rolling buffer of 500 messages
 
 ### UI Structure
 
 The WinForms UI is built using `System.Windows.Forms` and `System.Drawing`:
 
-- **Row 1** (top): Profile Root textbox, Load Profiles button, version label, GitHub button (top-right corner)
-- **Row 2**: User filter, age filter controls, WhatIf checkbox (default: checked), highlight controls
-- **DataGridView** (main area): Displays aggregated user profile data with manual row population
-- **Bottom row**: Status label, targeting checkboxes (ODFC-only/Profile-only - mutually exclusive), Reset Profile button, Close button
+- **Row 1** (top): Profile Root textbox (multi-root hint below), Load/Rescan buttons, version label, Theme dropdown, GitHub button
+- **Row 2**: User filter, age filter controls, WhatIf checkbox, Skip in-use checkbox, highlight controls, Export CSV button
+- **SplitContainer** (main area):
+  - **Panel 1**: DataGridView with 8 columns (User, # Cont, Profile GB, Office GB, Total GB, Last Write, SIDs, Root Folder)
+  - **Panel 2**: Embedded log panel with Clear button
+- **Bottom row**: Status label, ODFC-only/Profile-only checkboxes, Preview checkbox, Reset Profile button, Close button
 
 ### Key Design Patterns
 
 - **Manual DataGridView population**: Rows added explicitly, with profile objects stored in `Row.Tag` (not data-binding)
-- **Mutual exclusivity**: ODFC-only and Profile-only checkboxes use CheckedChanged events to ensure only one can be checked
-- **Filtering workflow**: `Apply-Filters` returns filtered subset; `Show-ProfilesInGrid` populates grid with highlighting
-- **Safety-first**: WhatIf mode defaults to ON, rename instead of delete, confirmation dialogs, per-user logging
+- **Column sorting**: Click headers to sort; uses `ColumnHeaderMouseClick` event with programmatic sorting
+- **Mutual exclusivity**: ODFC-only and Profile-only checkboxes use CheckedChanged events
+- **Theme system**: Theme definitions in `$script:Themes` hashtable; `Apply-Theme` function recurses through controls
+- **Preview workflow**: `Show-RenamePreviewDialog` returns DialogResult before any rename operation
+- **Safety-first**: WhatIf ON by default, Skip in-use ON by default, Preview ON by default, rename instead of delete
 
 ### Global Script Variables
 
 - `$script:AllProfiles`: Holds all loaded profile objects (before filtering)
-- `$script:DefaultRowBackColor`: Stores original grid row color for highlight toggling
-- `$appVersion`: Version string displayed in title and UI
+- `$script:DefaultRowBackColor`: Current theme's grid background color
+- `$script:CurrentHighlightColor`: Current theme's highlight color
+- `$script:Themes`: Hashtable of Light/Dark theme definitions
+- `$script:CurrentTheme`: "Light" or "Dark"
+- `$script:LogMessages`: ArrayList of log entries for embedded panel
+- `$script:txtLog`: Reference to log TextBox control
+- `$script:SortColumn`: Currently sorted column index (-1 if none)
+- `$script:SortAscending`: Sort direction boolean
+- `$appVersion`: Version string (0.6.0)
 
 ## Common Development Tasks
 
 ### Modifying Username Detection Logic
 
-If the FSLogix folder naming scheme changes, edit the regex patterns in `Get-FSLogixProfiles` (lines 53-62):
-- Primary pattern: `'^(?<user>.+?)_S-1-5-21-'`
+Edit the regex patterns in `Get-FSLogixProfiles` (lines 163-175):
+- Primary pattern: `'^(?<user>.+?)_(?<sid>S-1-5-21-[\d-]+)'`
+- Captures both username and SID groups
 - Fallback checks both folder name and file basename
 
 ### Adding New Grid Columns
 
-Use the `Add-Col` helper function (lines 418-423), then update `Show-ProfilesInGrid` to populate the new column cells.
+1. Use `Add-Col` helper function (line 851-857) to add column definition
+2. Update `Show-ProfilesInGrid` to populate the new column cells
+3. Update column sorting switch statement in `ColumnHeaderMouseClick` handler
+4. Update `Export-GridToCSV` if column needs special handling
 
 ### Changing Container Classification
 
-ODFC/Office detection uses regex `'odfc|office'` (line 94). Modify this pattern to adjust classification logic.
+ODFC/Office detection uses regex `'odfc|office'` (lines 217, 277, 282, 477-481). Modify this pattern to adjust classification logic.
 
 ### Extending Rename Behavior
 
-The rename logic is in `Rename-FSLogixProfileObject`. Current pattern: `"{0}-old{1}" -f $base, $ext` (line 176). Modify to change naming scheme.
+The rename logic is in `Rename-FSLogixProfileObject`. Current pattern: `"{0}-old{1}" -f $base, $ext` (line 312). Modify to change naming scheme.
+
+### Adding New Themes
+
+Add new theme definition to `$script:Themes` hashtable (lines 31-63). Required properties:
+- FormBackColor, FormForeColor
+- GridBackColor, GridForeColor, GridHeaderBackColor, GridHeaderForeColor, GridAlternateRowColor
+- HighlightColor
+- ButtonBackColor, ButtonForeColor
+- TextBoxBackColor, TextBoxForeColor
+- LogPanelBackColor, LogPanelForeColor
+
+Then add the theme name to `$cmbTheme.Items` (lines 692-693).
 
 ## Important Constraints and Behaviors
 
 - **No deletion**: Tool never deletes files, only renames them
-- **No open-handle detection**: Tool does not check if containers are in use before renaming
-- **Single profile root**: Designed for one UNC path per session (Cloud Cache secondary paths not supported in v0.5.2)
+- **Open-handle detection**: Enabled by default; uses file lock test (may have false negatives for network shares)
+- **Multi-root support**: Semicolon-separated paths; results merged by username
 - **PowerShell 5.1+ required**: Uses .NET Framework WinForms assemblies
-- **Network access required**: Must have access to the FSLogix UNC share
+- **Network access required**: Must have access to the FSLogix UNC share(s)
+- **STA mode required**: WinForms requires Single-Threaded Apartment mode
 
-## Planned Features (v0.6+)
+## Version History
 
-See CHANGELOG.txt lines 118-138 for roadmap:
-- SID column or per-folder breakdown
-- CSV export functionality
-- Per-column sorting in DataGridView
-- Multi-root / Cloud Cache support
-- Advanced rename preview dialog
-- Open-handle detection before rename
-- UI theming (light/dark mode)
-- Embedded logging panel
-- Manual rescan button
+- **v0.6.0**: Major feature release - SID column, CSV export, column sorting, multi-root support, rename preview, open-handle detection, theming, embedded log panel, rescan button
+- **v0.5.2**: Profile-only/ODFC-only targeting, GitHub button
+- **v0.5.1**: Rename-based retire behavior (replaced delete)
+- **v0.5.0**: Initial FSLogix Horizon IC-focused build
