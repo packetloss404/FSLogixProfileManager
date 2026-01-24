@@ -1,6 +1,6 @@
 <#
 FSLogix Profile Manager - Horizon Instant Clones
-Version: 0.6.0
+Version: 0.7.0
 
 Environment:
   Root: \\fml-fslogix\FSLogixUserProfiles (supports multiple paths separated by semicolon)
@@ -10,9 +10,8 @@ This tool:
   - Finds all *.vhd / *.vhdx under the root(s)
   - Derives username from the folder name (before "_S-1-5-21-")
   - Shows one row per user (aggregated across SIDs) with SID breakdown
+  - Detects corrupt profiles, orphaned users (not in AD), and disk space issues
   - Lets you filter, highlight big profiles, and retire containers (with WhatIf).
-  - Has options to target ONLY ODFC/Office containers or ONLY Profile containers.
-  - Instead of deleting containers, this version RENAMES them with "-old" before the extension.
   - Supports multiple profile roots (Cloud Cache), CSV export, column sorting, and theming.
 #>
 
@@ -20,7 +19,7 @@ param(
     [string]$DefaultProfileRoot = "\\fml-fslogix\FSLogixUserProfiles"
 )
 
-$appVersion = "0.6.0"
+$appVersion = "0.7.0"
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
@@ -65,6 +64,10 @@ $script:Themes = @{
 
 $script:CurrentTheme = "Light"
 $script:LogMessages = [System.Collections.ArrayList]::new()
+
+# Common VHD size limits (in GB) - FSLogix defaults
+$script:CommonSizeLimits = @(30, 50, 100, 120)
+$script:SizeWarningThresholdPercent = 90
 
 # --------------------------------------------------------------------
 #  Logging helper for embedded log panel
@@ -127,16 +130,157 @@ function Get-InUseContainers {
 }
 
 # --------------------------------------------------------------------
-#  FSLogix scan + username detection (with SID tracking)
+#  AD Orphan Detection
+# --------------------------------------------------------------------
+function Test-UserExistsInAD {
+    param([string]$UserName)
+
+    # Try multiple methods to check if user exists
+    try {
+        # Method 1: Try ADSI searcher (works without AD module)
+        $searcher = [adsisearcher]"(samaccountname=$UserName)"
+        $result = $searcher.FindOne()
+        return ($null -ne $result)
+    } catch {
+        # ADSI failed, try AD module if available
+        try {
+            if (Get-Command Get-ADUser -ErrorAction SilentlyContinue) {
+                $user = Get-ADUser -Identity $UserName -ErrorAction SilentlyContinue
+                return ($null -ne $user)
+            }
+        } catch {
+            # AD module query failed
+        }
+    }
+
+    # If we can't query AD, assume user exists (don't mark as orphan)
+    return $true
+}
+
+$script:ADCheckEnabled = $false
+$script:ADCheckCache = @{}
+
+function Initialize-ADCheck {
+    # Test if we can query AD
+    try {
+        $searcher = [adsisearcher]"(samaccountname=Administrator)"
+        $result = $searcher.FindOne()
+        $script:ADCheckEnabled = $true
+        Add-LogMessage "AD connectivity verified - orphan detection enabled" "INFO"
+        return $true
+    } catch {
+        $script:ADCheckEnabled = $false
+        Add-LogMessage "AD not available - orphan detection disabled" "WARN"
+        return $false
+    }
+}
+
+function Get-UserADStatus {
+    param([string]$UserName)
+
+    if (-not $script:ADCheckEnabled) {
+        return "UNKNOWN"
+    }
+
+    # Check cache first
+    if ($script:ADCheckCache.ContainsKey($UserName)) {
+        return $script:ADCheckCache[$UserName]
+    }
+
+    # Query AD
+    $exists = Test-UserExistsInAD -UserName $UserName
+    $status = if ($exists) { "OK" } else { "ORPHAN" }
+    $script:ADCheckCache[$UserName] = $status
+
+    return $status
+}
+
+# --------------------------------------------------------------------
+#  VHD Health Check
+# --------------------------------------------------------------------
+function Get-VHDHealth {
+    param(
+        [string]$FilePath,
+        [double]$FileSizeGB
+    )
+
+    $issues = @()
+
+    # Check for CORRUPT in filename
+    $fileName = Split-Path -Leaf $FilePath
+    if ($fileName -match 'CORRUPT') {
+        $issues += "CORRUPT"
+    }
+
+    # Check for -old (already retired)
+    if ($fileName -match '-old\.vhdx?$') {
+        $issues += "RETIRED"
+    }
+
+    # Check if file size is near common limits
+    foreach ($limit in $script:CommonSizeLimits) {
+        $threshold = $limit * ($script:SizeWarningThresholdPercent / 100)
+        if ($FileSizeGB -ge $threshold -and $FileSizeGB -le $limit) {
+            $issues += "NEAR_LIMIT"
+            break
+        }
+    }
+
+    # Check if file is very small (might be corrupt/empty)
+    if ($FileSizeGB -lt 0.001 -and (Test-Path $FilePath)) {
+        $issues += "EMPTY"
+    }
+
+    if ($issues.Count -eq 0) {
+        return "OK"
+    }
+
+    return ($issues -join ",")
+}
+
+function Get-VHDMaxSize {
+    param([string]$FilePath)
+
+    # Try to get max size using Get-VHD if Hyper-V module is available
+    try {
+        if (Get-Command Get-VHD -ErrorAction SilentlyContinue) {
+            $vhd = Get-VHD -Path $FilePath -ErrorAction SilentlyContinue
+            if ($vhd) {
+                return [Math]::Round($vhd.Size / 1GB, 2)
+            }
+        }
+    } catch {
+        # Get-VHD not available or failed
+    }
+
+    # Fallback: guess based on common limits
+    $fileSizeGB = (Get-Item $FilePath -ErrorAction SilentlyContinue).Length / 1GB
+    foreach ($limit in ($script:CommonSizeLimits | Sort-Object)) {
+        if ($fileSizeGB -lt $limit) {
+            return $limit
+        }
+    }
+
+    return 30  # Default FSLogix limit
+}
+
+# --------------------------------------------------------------------
+#  FSLogix scan + username detection (with SID tracking + health)
 # --------------------------------------------------------------------
 function Get-FSLogixProfiles {
     param(
         [Parameter(Mandatory=$true)]
-        [string[]]$ProfileRoots
+        [string[]]$ProfileRoots,
+        [bool]$CheckOrphans = $false
     )
 
     $userTable = @{}
     $debugLimit = 10
+
+    # Initialize AD check if orphan detection requested
+    if ($CheckOrphans) {
+        Initialize-ADCheck
+    }
 
     foreach ($ProfileRoot in $ProfileRoots) {
         $ProfileRoot = $ProfileRoot.Trim()
@@ -183,6 +327,8 @@ function Get-FSLogixProfiles {
                 $debugLimit--
             }
 
+            $fileSizeGB = [Math]::Round($file.Length / 1GB, 3)
+
             if (-not $userTable.ContainsKey($userNameGuess)) {
                 $userTable[$userNameGuess] = [PSCustomObject]@{
                     UserName       = $userNameGuess
@@ -190,11 +336,14 @@ function Get-FSLogixProfiles {
                     ProfileSizeGB  = 0.0
                     OfficeSizeGB   = 0.0
                     TotalSizeGB    = 0.0
+                    MaxSizeGB      = 0.0
                     LastWriteTime  = $file.LastWriteTime
                     RootFolder     = $file.DirectoryName
                     ContainerFiles = @()
                     SIDs           = [System.Collections.Generic.HashSet[string]]::new()
                     ProfileRoots   = [System.Collections.Generic.HashSet[string]]::new()
+                    HealthIssues   = [System.Collections.Generic.HashSet[string]]::new()
+                    ADStatus       = "UNKNOWN"
                 }
             }
 
@@ -211,13 +360,25 @@ function Get-FSLogixProfiles {
             # Track which roots this user appears in
             [void]$entry.ProfileRoots.Add($ProfileRoot)
 
-            $sizeGB = [Math]::Round($file.Length / 1GB, 3)
+            # Check VHD health
+            $health = Get-VHDHealth -FilePath $file.FullName -FileSizeGB $fileSizeGB
+            if ($health -ne "OK") {
+                foreach ($issue in ($health -split ',')) {
+                    [void]$entry.HealthIssues.Add($issue)
+                }
+            }
+
+            # Track max size (use largest container's limit)
+            $maxSize = Get-VHDMaxSize -FilePath $file.FullName
+            if ($maxSize -gt $entry.MaxSizeGB) {
+                $entry.MaxSizeGB = $maxSize
+            }
 
             # Simple classification: Office vs Profile by filename
             if ($file.Name -match 'odfc|office') {
-                $entry.OfficeSizeGB += $sizeGB
+                $entry.OfficeSizeGB += $fileSizeGB
             } else {
-                $entry.ProfileSizeGB += $sizeGB
+                $entry.ProfileSizeGB += $fileSizeGB
             }
 
             $entry.TotalSizeGB = $entry.ProfileSizeGB + $entry.OfficeSizeGB
@@ -231,6 +392,21 @@ function Get-FSLogixProfiles {
                 $entry.RootFolder = $file.DirectoryName
             }
         }
+    }
+
+    # Check AD status for each user if enabled
+    if ($CheckOrphans -and $script:ADCheckEnabled) {
+        Add-LogMessage "Checking AD status for $($userTable.Count) users..." "INFO"
+        $orphanCount = 0
+        foreach ($user in $userTable.Keys) {
+            $status = Get-UserADStatus -UserName $user
+            $userTable[$user].ADStatus = $status
+            if ($status -eq "ORPHAN") {
+                [void]$userTable[$user].HealthIssues.Add("ORPHAN")
+                $orphanCount++
+            }
+        }
+        Add-LogMessage "Found $orphanCount orphaned profiles" "INFO"
     }
 
     Add-LogMessage "Total unique users found: $($userTable.Count)" "INFO"
@@ -345,7 +521,8 @@ function Apply-Filters {
         [System.Collections.IEnumerable]$Source,
         [string]$UserFilter,
         [bool]$UseAge,
-        [int]$AgeDays
+        [int]$AgeDays,
+        [bool]$OnlyIssues = $false
     )
 
     $filtered = $Source
@@ -360,6 +537,12 @@ function Apply-Filters {
         $threshold = (Get-Date).AddDays(-$AgeDays)
         $filtered = $filtered | Where-Object {
             $_.LastWriteTime -lt $threshold
+        }
+    }
+
+    if ($OnlyIssues) {
+        $filtered = $filtered | Where-Object {
+            $_.HealthIssues.Count -gt 0
         }
     }
 
@@ -382,6 +565,22 @@ function Update-RowHighlight {
     if (-not $ProfileObject) {
         $Row.DefaultCellStyle.BackColor = $DefaultColor
         return
+    }
+
+    # Priority: Health issues > Size highlight
+    if ($ProfileObject.HealthIssues.Count -gt 0) {
+        if ($ProfileObject.HealthIssues -contains "CORRUPT") {
+            $Row.DefaultCellStyle.BackColor = [System.Drawing.Color]::LightCoral
+            return
+        }
+        if ($ProfileObject.HealthIssues -contains "ORPHAN") {
+            $Row.DefaultCellStyle.BackColor = [System.Drawing.Color]::LightGoldenrodYellow
+            return
+        }
+        if ($ProfileObject.HealthIssues -contains "NEAR_LIMIT") {
+            $Row.DefaultCellStyle.BackColor = [System.Drawing.Color]::PeachPuff
+            return
+        }
     }
 
     if (-not $HighlightEnabled) {
@@ -633,7 +832,7 @@ function Apply-Theme {
 # --------------------------------------------------------------------
 $form = New-Object System.Windows.Forms.Form
 $form.Text = "FSLogix Profile Manager (Horizon IC) - v$appVersion"
-$form.Size = New-Object System.Drawing.Size(1100, 800)
+$form.Size = New-Object System.Drawing.Size(1200, 800)
 $form.StartPosition = "CenterScreen"
 $form.AutoScaleMode = 'None'
 
@@ -647,7 +846,7 @@ $form.Controls.Add($lblRoot)
 
 $txtRoot = New-Object System.Windows.Forms.TextBox
 $txtRoot.Location = New-Object System.Drawing.Point(100, 12)
-$txtRoot.Size = New-Object System.Drawing.Size(480, 22)
+$txtRoot.Size = New-Object System.Drawing.Size(420, 22)
 $txtRoot.Text = $DefaultProfileRoot
 $form.Controls.Add($txtRoot)
 
@@ -661,19 +860,26 @@ $form.Controls.Add($lblRootHint)
 
 $btnLoad = New-Object System.Windows.Forms.Button
 $btnLoad.Text = "Load Profiles"
-$btnLoad.Location = New-Object System.Drawing.Point(590, 10)
+$btnLoad.Location = New-Object System.Drawing.Point(530, 10)
 $btnLoad.Size = New-Object System.Drawing.Size(100, 28)
 $form.Controls.Add($btnLoad)
 
 $btnRescan = New-Object System.Windows.Forms.Button
 $btnRescan.Text = "Rescan"
-$btnRescan.Location = New-Object System.Drawing.Point(695, 10)
-$btnRescan.Size = New-Object System.Drawing.Size(70, 28)
+$btnRescan.Location = New-Object System.Drawing.Point(635, 10)
+$btnRescan.Size = New-Object System.Drawing.Size(60, 28)
 $form.Controls.Add($btnRescan)
+
+$chkCheckOrphans = New-Object System.Windows.Forms.CheckBox
+$chkCheckOrphans.Text = "Check AD"
+$chkCheckOrphans.Location = New-Object System.Drawing.Point(705, 14)
+$chkCheckOrphans.AutoSize = $true
+$chkCheckOrphans.Checked = $false
+$form.Controls.Add($chkCheckOrphans)
 
 $lblVersion = New-Object System.Windows.Forms.Label
 $lblVersion.Text = "v$appVersion"
-$lblVersion.Location = New-Object System.Drawing.Point(780, 15)
+$lblVersion.Location = New-Object System.Drawing.Point(800, 15)
 $lblVersion.AutoSize = $true
 $lblVersion.ForeColor = [System.Drawing.Color]::DarkGray
 $form.Controls.Add($lblVersion)
@@ -681,12 +887,12 @@ $form.Controls.Add($lblVersion)
 # Theme selector
 $lblTheme = New-Object System.Windows.Forms.Label
 $lblTheme.Text = "Theme:"
-$lblTheme.Location = New-Object System.Drawing.Point(840, 15)
+$lblTheme.Location = New-Object System.Drawing.Point(860, 15)
 $lblTheme.AutoSize = $true
 $form.Controls.Add($lblTheme)
 
 $cmbTheme = New-Object System.Windows.Forms.ComboBox
-$cmbTheme.Location = New-Object System.Drawing.Point(890, 12)
+$cmbTheme.Location = New-Object System.Drawing.Point(910, 12)
 $cmbTheme.Size = New-Object System.Drawing.Size(70, 22)
 $cmbTheme.DropDownStyle = "DropDownList"
 [void]$cmbTheme.Items.Add("Light")
@@ -696,7 +902,6 @@ $form.Controls.Add($cmbTheme)
 
 # --- GitHub Icon Button (Top Right) ---
 
-# Base64-encoded GitHub logo PNG (16x16)
 $GitHubIconBase64 = @"
 iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAMAAAAoLQ9TAAAAjVBMVEUAAAD///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////9n8UQeAAAAOHRSTlMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADxoaZ2drb3F1e4GHi5GSl5ydnp+go6Wmqa+wsbK0tri5vsHBwoe9JbEAAABLSURBVBgZBcEJEoMgEADRA2Xn7p3d/79HiA36VnHzVvzkhxHIAk2ZaR5uHHJZlFQcg6gkKgq6HgNwGpCUXlorblSdaCjWsUngKCZLXwoRaBAAAAASUVORK5CYII=
 "@
@@ -711,7 +916,7 @@ try {
 }
 
 $btnGithub = New-Object System.Windows.Forms.Button
-$btnGithub.Location = New-Object System.Drawing.Point(1020, 10)
+$btnGithub.Location = New-Object System.Drawing.Point(1120, 10)
 $btnGithub.Size     = New-Object System.Drawing.Size(28, 28)
 $btnGithub.FlatStyle = 'Flat'
 $btnGithub.FlatAppearance.BorderSize = 0
@@ -740,24 +945,24 @@ $form.Controls.Add($lblFilter)
 
 $txtFilter = New-Object System.Windows.Forms.TextBox
 $txtFilter.Location = New-Object System.Drawing.Point(100, 52)
-$txtFilter.Size = New-Object System.Drawing.Size(150, 22)
+$txtFilter.Size = New-Object System.Drawing.Size(120, 22)
 $form.Controls.Add($txtFilter)
 
 $btnApplyFilter = New-Object System.Windows.Forms.Button
-$btnApplyFilter.Text = "Apply Filter"
-$btnApplyFilter.Location = New-Object System.Drawing.Point(260, 50)
-$btnApplyFilter.Size = New-Object System.Drawing.Size(90, 26)
+$btnApplyFilter.Text = "Apply"
+$btnApplyFilter.Location = New-Object System.Drawing.Point(225, 50)
+$btnApplyFilter.Size = New-Object System.Drawing.Size(55, 26)
 $form.Controls.Add($btnApplyFilter)
 
 # Last-used filter
 $chkAge = New-Object System.Windows.Forms.CheckBox
-$chkAge.Text = "Last used >"
-$chkAge.Location = New-Object System.Drawing.Point(360, 53)
+$chkAge.Text = "Older than"
+$chkAge.Location = New-Object System.Drawing.Point(290, 53)
 $chkAge.AutoSize = $true
 $form.Controls.Add($chkAge)
 
 $numAge = New-Object System.Windows.Forms.NumericUpDown
-$numAge.Location = New-Object System.Drawing.Point(455, 52)
+$numAge.Location = New-Object System.Drawing.Point(375, 52)
 $numAge.Minimum = 1
 $numAge.Maximum = 3650
 $numAge.Value = 30
@@ -766,14 +971,21 @@ $form.Controls.Add($numAge)
 
 $lblDays = New-Object System.Windows.Forms.Label
 $lblDays.Text = "days"
-$lblDays.Location = New-Object System.Drawing.Point(510, 55)
+$lblDays.Location = New-Object System.Drawing.Point(430, 55)
 $lblDays.AutoSize = $true
 $form.Controls.Add($lblDays)
 
+# Show only issues
+$chkOnlyIssues = New-Object System.Windows.Forms.CheckBox
+$chkOnlyIssues.Text = "Issues only"
+$chkOnlyIssues.Location = New-Object System.Drawing.Point(480, 53)
+$chkOnlyIssues.AutoSize = $true
+$form.Controls.Add($chkOnlyIssues)
+
 # WhatIf
 $chkWhatIf = New-Object System.Windows.Forms.CheckBox
-$chkWhatIf.Text = "WhatIf (simulate)"
-$chkWhatIf.Location = New-Object System.Drawing.Point(560, 53)
+$chkWhatIf.Text = "WhatIf"
+$chkWhatIf.Location = New-Object System.Drawing.Point(580, 53)
 $chkWhatIf.AutoSize = $true
 $chkWhatIf.Checked = $true
 $form.Controls.Add($chkWhatIf)
@@ -781,7 +993,7 @@ $form.Controls.Add($chkWhatIf)
 # Check In Use
 $chkCheckInUse = New-Object System.Windows.Forms.CheckBox
 $chkCheckInUse.Text = "Skip in-use"
-$chkCheckInUse.Location = New-Object System.Drawing.Point(700, 53)
+$chkCheckInUse.Location = New-Object System.Drawing.Point(660, 53)
 $chkCheckInUse.AutoSize = $true
 $chkCheckInUse.Checked = $true
 $form.Controls.Add($chkCheckInUse)
@@ -789,37 +1001,61 @@ $form.Controls.Add($chkCheckInUse)
 # Highlight big profiles
 $chkHighlight = New-Object System.Windows.Forms.CheckBox
 $chkHighlight.Text = "Highlight >"
-$chkHighlight.Location = New-Object System.Drawing.Point(800, 53)
+$chkHighlight.Location = New-Object System.Drawing.Point(760, 53)
 $chkHighlight.AutoSize = $true
 $chkHighlight.Checked = $true
 $form.Controls.Add($chkHighlight)
 
 $numHighlight = New-Object System.Windows.Forms.NumericUpDown
-$numHighlight.Location = New-Object System.Drawing.Point(890, 52)
+$numHighlight.Location = New-Object System.Drawing.Point(850, 52)
 $numHighlight.Minimum = 1
 $numHighlight.Maximum = 10000
 $numHighlight.Value = 20
-$numHighlight.Size = New-Object System.Drawing.Size(55, 22)
+$numHighlight.Size = New-Object System.Drawing.Size(50, 22)
 $form.Controls.Add($numHighlight)
 
 $lblHighlightGb = New-Object System.Windows.Forms.Label
 $lblHighlightGb.Text = "GB"
-$lblHighlightGb.Location = New-Object System.Drawing.Point(950, 55)
+$lblHighlightGb.Location = New-Object System.Drawing.Point(905, 55)
 $lblHighlightGb.AutoSize = $true
 $form.Controls.Add($lblHighlightGb)
 
-# --- Row 3: Export button ---
+# Export button
 $btnExport = New-Object System.Windows.Forms.Button
 $btnExport.Text = "Export CSV"
-$btnExport.Location = New-Object System.Drawing.Point(1000, 50)
+$btnExport.Location = New-Object System.Drawing.Point(950, 50)
 $btnExport.Size = New-Object System.Drawing.Size(80, 26)
 $form.Controls.Add($btnExport)
+
+# --- Legend ---
+$lblLegend = New-Object System.Windows.Forms.Label
+$lblLegend.Text = "Legend: "
+$lblLegend.Location = New-Object System.Drawing.Point(1040, 55)
+$lblLegend.AutoSize = $true
+$lblLegend.Font = New-Object System.Drawing.Font("Segoe UI", 7)
+$form.Controls.Add($lblLegend)
+
+$lblLegendCorrupt = New-Object System.Windows.Forms.Label
+$lblLegendCorrupt.Text = "■ Corrupt"
+$lblLegendCorrupt.Location = New-Object System.Drawing.Point(1085, 55)
+$lblLegendCorrupt.AutoSize = $true
+$lblLegendCorrupt.ForeColor = [System.Drawing.Color]::LightCoral
+$lblLegendCorrupt.Font = New-Object System.Drawing.Font("Segoe UI", 7)
+$form.Controls.Add($lblLegendCorrupt)
+
+$lblLegendOrphan = New-Object System.Windows.Forms.Label
+$lblLegendOrphan.Text = "■ Orphan"
+$lblLegendOrphan.Location = New-Object System.Drawing.Point(1130, 55)
+$lblLegendOrphan.AutoSize = $true
+$lblLegendOrphan.ForeColor = [System.Drawing.Color]::Goldenrod
+$lblLegendOrphan.Font = New-Object System.Drawing.Font("Segoe UI", 7)
+$form.Controls.Add($lblLegendOrphan)
 
 # --- SplitContainer for Grid + Log Panel ---
 
 $splitContainer = New-Object System.Windows.Forms.SplitContainer
 $splitContainer.Location = New-Object System.Drawing.Point(10, 85)
-$splitContainer.Size = New-Object System.Drawing.Size(1060, 620)
+$splitContainer.Size = New-Object System.Drawing.Size(1160, 620)
 $splitContainer.Orientation = "Horizontal"
 $splitContainer.SplitterDistance = 480
 $splitContainer.Panel1MinSize = 200
@@ -856,14 +1092,15 @@ function Add-Col([string]$header, [int]$width, [string]$sortMode = "Automatic") 
     [void]$grid.Columns.Add($col)
 }
 
-Add-Col "User"          120 "Programmatic"  # col 0
-Add-Col "# Cont"         60 "Programmatic"  # col 1
-Add-Col "Profile GB"     80 "Programmatic"  # col 2
-Add-Col "Office GB"      80 "Programmatic"  # col 3
-Add-Col "Total GB"       80 "Programmatic"  # col 4
-Add-Col "Last Write"    130 "Programmatic"  # col 5
-Add-Col "SIDs"          180 "Programmatic"  # col 6
-Add-Col "Root Folder"   280 "Programmatic"  # col 7
+Add-Col "User"          100 "Programmatic"  # col 0
+Add-Col "# Cont"         50 "Programmatic"  # col 1
+Add-Col "Used GB"        70 "Programmatic"  # col 2
+Add-Col "Max GB"         60 "Programmatic"  # col 3
+Add-Col "Office GB"      70 "Programmatic"  # col 4
+Add-Col "Last Write"    120 "Programmatic"  # col 5
+Add-Col "Status"        100 "Programmatic"  # col 6
+Add-Col "SIDs"          150 "Programmatic"  # col 7
+Add-Col "Root Folder"   300 "Programmatic"  # col 8
 
 # --- Log Panel ---
 
@@ -881,7 +1118,7 @@ $script:txtLog.ReadOnly = $true
 $script:txtLog.Font = New-Object System.Drawing.Font("Consolas", 9)
 $script:txtLog.Dock = "None"
 $script:txtLog.Anchor = "Top,Left,Right,Bottom"
-$script:txtLog.Size = New-Object System.Drawing.Size(1060, 100)
+$script:txtLog.Size = New-Object System.Drawing.Size(1160, 100)
 $splitContainer.Panel2.Controls.Add($script:txtLog)
 
 # Adjust log panel size on split
@@ -904,21 +1141,21 @@ $btnClearLog.Add_Click({
 
 $lblStatus = New-Object System.Windows.Forms.Label
 $lblStatus.Location = New-Object System.Drawing.Point(10, 715)
-$lblStatus.Size = New-Object System.Drawing.Size(360, 20)
+$lblStatus.Size = New-Object System.Drawing.Size(400, 20)
 $lblStatus.Text = "Ready."
 $lblStatus.Anchor = "Bottom,Left"
 $form.Controls.Add($lblStatus)
 
 $chkDeleteOdfc = New-Object System.Windows.Forms.CheckBox
-$chkDeleteOdfc.Text = "Only ODFC (Office) containers"
-$chkDeleteOdfc.Location = New-Object System.Drawing.Point(380, 715)
+$chkDeleteOdfc.Text = "Only ODFC"
+$chkDeleteOdfc.Location = New-Object System.Drawing.Point(420, 715)
 $chkDeleteOdfc.AutoSize = $true
 $chkDeleteOdfc.Anchor = "Bottom,Left"
 $form.Controls.Add($chkDeleteOdfc)
 
 $chkDeleteProfile = New-Object System.Windows.Forms.CheckBox
-$chkDeleteProfile.Text = "Only Profile containers"
-$chkDeleteProfile.Location = New-Object System.Drawing.Point(580, 715)
+$chkDeleteProfile.Text = "Only Profile"
+$chkDeleteProfile.Location = New-Object System.Drawing.Point(520, 715)
 $chkDeleteProfile.AutoSize = $true
 $chkDeleteProfile.Anchor = "Bottom,Left"
 $form.Controls.Add($chkDeleteProfile)
@@ -934,7 +1171,7 @@ $chkDeleteProfile.Add_CheckedChanged({
 
 $chkPreview = New-Object System.Windows.Forms.CheckBox
 $chkPreview.Text = "Preview"
-$chkPreview.Location = New-Object System.Drawing.Point(750, 715)
+$chkPreview.Location = New-Object System.Drawing.Point(620, 715)
 $chkPreview.AutoSize = $true
 $chkPreview.Checked = $true
 $chkPreview.Anchor = "Bottom,Left"
@@ -942,14 +1179,14 @@ $form.Controls.Add($chkPreview)
 
 $btnDelete = New-Object System.Windows.Forms.Button
 $btnDelete.Text = "Reset Profile"
-$btnDelete.Location = New-Object System.Drawing.Point(850, 710)
+$btnDelete.Location = New-Object System.Drawing.Point(950, 710)
 $btnDelete.Size = New-Object System.Drawing.Size(100, 28)
 $btnDelete.Anchor = "Bottom,Right"
 $form.Controls.Add($btnDelete)
 
 $btnClose = New-Object System.Windows.Forms.Button
 $btnClose.Text = "Close"
-$btnClose.Location = New-Object System.Drawing.Point(960, 710)
+$btnClose.Location = New-Object System.Drawing.Point(1060, 710)
 $btnClose.Size = New-Object System.Drawing.Size(60, 28)
 $btnClose.Anchor = "Bottom,Right"
 $form.Controls.Add($btnClose)
@@ -970,21 +1207,30 @@ function Show-ProfilesInGrid {
         $row = $grid.Rows[$idx]
         $row.Cells[0].Value = $p.UserName
         $row.Cells[1].Value = $p.ContainerCount
-        $row.Cells[2].Value = $p.ProfileSizeGB
-        $row.Cells[3].Value = $p.OfficeSizeGB
-        $row.Cells[4].Value = $p.TotalSizeGB
-        $row.Cells[5].Value = $p.LastWriteTime
+        $row.Cells[2].Value = [Math]::Round($p.TotalSizeGB, 1)
+        $row.Cells[3].Value = $p.MaxSizeGB
+        $row.Cells[4].Value = [Math]::Round($p.OfficeSizeGB, 1)
+        $row.Cells[5].Value = $p.LastWriteTime.ToString("yyyy-MM-dd HH:mm")
+
+        # Status column
+        $issues = @($p.HealthIssues)
+        if ($issues.Count -eq 0) {
+            $row.Cells[6].Value = "OK"
+        } else {
+            $row.Cells[6].Value = ($issues -join ", ")
+        }
+        $row.Cells[6].ToolTipText = "AD Status: $($p.ADStatus)"
 
         # SID column - show abbreviated SIDs
         $sidList = @($p.SIDs)
         if ($sidList.Count -le 2) {
-            $row.Cells[6].Value = ($sidList -join "; ")
+            $row.Cells[7].Value = ($sidList -join "; ")
         } else {
-            $row.Cells[6].Value = "$($sidList[0]); ... (+$($sidList.Count - 1) more)"
+            $row.Cells[7].Value = "$($sidList[0]); ... (+$($sidList.Count - 1) more)"
         }
-        $row.Cells[6].ToolTipText = ($sidList -join "`n")
+        $row.Cells[7].ToolTipText = ($sidList -join "`n")
 
-        $row.Cells[7].Value = $p.RootFolder
+        $row.Cells[8].Value = $p.RootFolder
 
         # Store the object on the row for later use
         $row.Tag = $p
@@ -1037,12 +1283,13 @@ $grid.Add_ColumnHeaderMouseClick({
     $sorted = switch ($colIndex) {
         0 { $profiles | Sort-Object UserName }
         1 { $profiles | Sort-Object ContainerCount }
-        2 { $profiles | Sort-Object ProfileSizeGB }
-        3 { $profiles | Sort-Object OfficeSizeGB }
-        4 { $profiles | Sort-Object TotalSizeGB }
+        2 { $profiles | Sort-Object TotalSizeGB }
+        3 { $profiles | Sort-Object MaxSizeGB }
+        4 { $profiles | Sort-Object OfficeSizeGB }
         5 { $profiles | Sort-Object LastWriteTime }
-        6 { $profiles | Sort-Object { ($_.SIDs | Measure-Object).Count } }
-        7 { $profiles | Sort-Object RootFolder }
+        6 { $profiles | Sort-Object { ($_.HealthIssues | Measure-Object).Count } }
+        7 { $profiles | Sort-Object { ($_.SIDs | Measure-Object).Count } }
+        8 { $profiles | Sort-Object RootFolder }
         default { $profiles }
     }
 
@@ -1068,17 +1315,24 @@ function Load-Profiles {
         $form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
         Add-LogMessage "Loading profiles..." "INFO"
 
+        # Clear AD cache
+        $script:ADCheckCache = @{}
+
         $roots = $txtRoot.Text -split ';' | ForEach-Object { $_.Trim() } | Where-Object { $_ }
-        $script:AllProfiles = Get-FSLogixProfiles -ProfileRoots $roots
+        $script:AllProfiles = Get-FSLogixProfiles -ProfileRoots $roots -CheckOrphans $chkCheckOrphans.Checked
 
         $filtered = Apply-Filters -Source $script:AllProfiles `
                                   -UserFilter $txtFilter.Text `
                                   -UseAge $chkAge.Checked `
-                                  -AgeDays ([int]$numAge.Value)
+                                  -AgeDays ([int]$numAge.Value) `
+                                  -OnlyIssues $chkOnlyIssues.Checked
 
         Show-ProfilesInGrid $filtered
-        $lblStatus.Text = "Loaded $($filtered.Count) user(s) from $($roots.Count) root(s)"
-        Add-LogMessage "Loaded $($filtered.Count) user(s)" "INFO"
+
+        # Count issues
+        $issueCount = ($script:AllProfiles | Where-Object { $_.HealthIssues.Count -gt 0 }).Count
+        $lblStatus.Text = "Loaded $($filtered.Count) user(s) from $($roots.Count) root(s). Issues: $issueCount"
+        Add-LogMessage "Loaded $($filtered.Count) user(s), $issueCount with issues" "INFO"
     }
     catch {
         [System.Windows.Forms.MessageBox]::Show("Error: $($_.Exception.Message)")
@@ -1106,7 +1360,8 @@ $btnApplyFilter.Add_Click({
     $filtered = Apply-Filters -Source $script:AllProfiles `
                               -UserFilter $txtFilter.Text `
                               -UseAge $chkAge.Checked `
-                              -AgeDays ([int]$numAge.Value)
+                              -AgeDays ([int]$numAge.Value) `
+                              -OnlyIssues $chkOnlyIssues.Checked
 
     Show-ProfilesInGrid $filtered
     $lblStatus.Text = "Filter: $($filtered.Count) user(s)"
@@ -1210,6 +1465,7 @@ Apply-Theme "Light"
 # Initial log message
 Add-LogMessage "FSLogix Profile Manager v$appVersion started" "INFO"
 Add-LogMessage "Ready. Enter profile root path(s) and click 'Load Profiles'" "INFO"
+Add-LogMessage "Enable 'Check AD' to detect orphaned profiles (requires AD connectivity)" "INFO"
 
 # Run
 [void]$form.ShowDialog()

@@ -1,5 +1,25 @@
 # FSLogix Profile Manager – Changelog
 
+## v0.7.0
+
+Health monitoring update. The tool now catches problems before they bite you.
+
+**VHD health checks** – Scans for corrupt profiles (files with "CORRUPT" in the name), empty/broken containers, and already-retired files. Shows up in the new Status column.
+
+**Disk space monitoring** – Grid now shows "Used GB" vs "Max GB" columns. Profiles approaching their size limit (90%+) get flagged as NEAR_LIMIT and highlighted orange.
+
+**Orphan detection** – Enable "Check AD" before loading to find profiles for users that no longer exist in Active Directory. Uses ADSI queries so no AD module needed. Results cached per session.
+
+**Status column** – New column shows health status: OK, CORRUPT, ORPHAN, NEAR_LIMIT, EMPTY, RETIRED. Color-coded rows make problems obvious.
+
+**Issues only filter** – New checkbox to show only profiles with problems. Useful for cleanup sessions.
+
+**Legend** – Added a color legend in the toolbar so you know what the highlights mean.
+
+Window a bit wider (1200px) to fit everything.
+
+---
+
 ## v0.6.0
 
 Big update. Finally got around to the features I've been putting off.
@@ -144,7 +164,8 @@ Window is bigger now (1100x800) to fit everything.
 ## Maybe someday
 
 - Scheduled/automated renames
-- AD integration for user lookup
 - Custom rename patterns (something other than `-old`)
 - Undo/restore (rename back from `-old`)
 - Keyboard shortcuts
+- VHD compaction (reclaim whitespace)
+- VHD repair (run chkdsk/Repair-Volume on containers)
