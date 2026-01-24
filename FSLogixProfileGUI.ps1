@@ -1,114 +1,239 @@
 <#
 FSLogix Profile Manager - Horizon Instant Clones
-Version: 0.5.2
+Version: 0.6.0
 
 Environment:
-  Root: \\fml-fslogix\FSLogixUserProfiles
+  Root: \\fml-fslogix\FSLogixUserProfiles (supports multiple paths separated by semicolon)
   Folder pattern: username_S-1-5-21-xxxxxxxx-xxxxxxxx-xxxxxxxx-xxxx
 
 This tool:
-  - Finds all *.vhd / *.vhdx under the root
+  - Finds all *.vhd / *.vhdx under the root(s)
   - Derives username from the folder name (before "_S-1-5-21-")
-  - Shows one row per user (aggregated across SIDs)
+  - Shows one row per user (aggregated across SIDs) with SID breakdown
   - Lets you filter, highlight big profiles, and retire containers (with WhatIf).
   - Has options to target ONLY ODFC/Office containers or ONLY Profile containers.
   - Instead of deleting containers, this version RENAMES them with "-old" before the extension.
+  - Supports multiple profile roots (Cloud Cache), CSV export, column sorting, and theming.
 #>
 
 param(
     [string]$DefaultProfileRoot = "\\fml-fslogix\FSLogixUserProfiles"
 )
 
-$appVersion = "0.5.2"
+$appVersion = "0.6.0"
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
 # --------------------------------------------------------------------
-#  FSLogix scan + username detection
+#  Theme definitions
+# --------------------------------------------------------------------
+$script:Themes = @{
+    Light = @{
+        FormBackColor = [System.Drawing.Color]::FromArgb(240, 240, 240)
+        FormForeColor = [System.Drawing.Color]::Black
+        GridBackColor = [System.Drawing.Color]::White
+        GridForeColor = [System.Drawing.Color]::Black
+        GridHeaderBackColor = [System.Drawing.Color]::FromArgb(230, 230, 230)
+        GridHeaderForeColor = [System.Drawing.Color]::Black
+        GridAlternateRowColor = [System.Drawing.Color]::FromArgb(245, 245, 245)
+        HighlightColor = [System.Drawing.Color]::MistyRose
+        ButtonBackColor = [System.Drawing.Color]::FromArgb(225, 225, 225)
+        ButtonForeColor = [System.Drawing.Color]::Black
+        TextBoxBackColor = [System.Drawing.Color]::White
+        TextBoxForeColor = [System.Drawing.Color]::Black
+        LogPanelBackColor = [System.Drawing.Color]::FromArgb(250, 250, 250)
+        LogPanelForeColor = [System.Drawing.Color]::Black
+    }
+    Dark = @{
+        FormBackColor = [System.Drawing.Color]::FromArgb(45, 45, 48)
+        FormForeColor = [System.Drawing.Color]::FromArgb(220, 220, 220)
+        GridBackColor = [System.Drawing.Color]::FromArgb(37, 37, 38)
+        GridForeColor = [System.Drawing.Color]::FromArgb(220, 220, 220)
+        GridHeaderBackColor = [System.Drawing.Color]::FromArgb(62, 62, 66)
+        GridHeaderForeColor = [System.Drawing.Color]::FromArgb(220, 220, 220)
+        GridAlternateRowColor = [System.Drawing.Color]::FromArgb(50, 50, 52)
+        HighlightColor = [System.Drawing.Color]::FromArgb(100, 60, 60)
+        ButtonBackColor = [System.Drawing.Color]::FromArgb(62, 62, 66)
+        ButtonForeColor = [System.Drawing.Color]::FromArgb(220, 220, 220)
+        TextBoxBackColor = [System.Drawing.Color]::FromArgb(37, 37, 38)
+        TextBoxForeColor = [System.Drawing.Color]::FromArgb(220, 220, 220)
+        LogPanelBackColor = [System.Drawing.Color]::FromArgb(30, 30, 30)
+        LogPanelForeColor = [System.Drawing.Color]::FromArgb(180, 180, 180)
+    }
+}
+
+$script:CurrentTheme = "Light"
+$script:LogMessages = [System.Collections.ArrayList]::new()
+
+# --------------------------------------------------------------------
+#  Logging helper for embedded log panel
+# --------------------------------------------------------------------
+function Add-LogMessage {
+    param([string]$Message, [string]$Level = "INFO")
+    $ts = Get-Date -Format "HH:mm:ss"
+    $entry = "[$ts] [$Level] $Message"
+    [void]$script:LogMessages.Add($entry)
+
+    # Keep only last 500 messages
+    while ($script:LogMessages.Count -gt 500) {
+        $script:LogMessages.RemoveAt(0)
+    }
+
+    # Update log panel if it exists
+    if ($script:txtLog -and $script:txtLog.IsHandleCreated) {
+        try {
+            $script:txtLog.Invoke([Action]{
+                $script:txtLog.AppendText("$entry`r`n")
+                $script:txtLog.SelectionStart = $script:txtLog.TextLength
+                $script:txtLog.ScrollToCaret()
+            })
+        } catch {
+            # Ignore invoke errors during form construction
+        }
+    }
+}
+
+# --------------------------------------------------------------------
+#  Open handle detection using file system
+# --------------------------------------------------------------------
+function Test-FileInUse {
+    param([string]$FilePath)
+
+    if (-not (Test-Path $FilePath)) {
+        return $false
+    }
+
+    try {
+        $stream = [System.IO.File]::Open($FilePath, 'Open', 'ReadWrite', 'None')
+        $stream.Close()
+        $stream.Dispose()
+        return $false
+    } catch {
+        return $true
+    }
+}
+
+function Get-InUseContainers {
+    param($ProfileObject)
+
+    $inUse = @()
+    foreach ($file in $ProfileObject.ContainerFiles) {
+        if (Test-FileInUse -FilePath $file) {
+            $inUse += $file
+        }
+    }
+    return $inUse
+}
+
+# --------------------------------------------------------------------
+#  FSLogix scan + username detection (with SID tracking)
 # --------------------------------------------------------------------
 function Get-FSLogixProfiles {
     param(
         [Parameter(Mandatory=$true)]
-        [string]$ProfileRoot
+        [string[]]$ProfileRoots
     )
-
-    if (-not (Test-Path $ProfileRoot)) {
-        throw "Profile root not found: $ProfileRoot"
-    }
-
-    # All container files
-    $vhdFiles = Get-ChildItem -Path $ProfileRoot -Recurse -File -Filter *.vhd* -ErrorAction SilentlyContinue
-    Write-Host "DEBUG: Found $($vhdFiles.Count) .vhd/.vhdx files under $ProfileRoot"
 
     $userTable = @{}
     $debugLimit = 10
 
-    foreach ($file in $vhdFiles) {
-        # Folder that contains the SID, e.g. vditest1_S-1-5-21-1602...
-        $folderLeaf = Split-Path $file.DirectoryName -Leaf
-        $userNameGuess = $null
+    foreach ($ProfileRoot in $ProfileRoots) {
+        $ProfileRoot = $ProfileRoot.Trim()
+        if ([string]::IsNullOrWhiteSpace($ProfileRoot)) { continue }
 
-        # Pattern: username_S-1-5-21-...
-        if ($folderLeaf -match '^(?<user>.+?)_S-1-5-21-') {
-            $userNameGuess = $Matches['user']
-        }
-        elseif ($file.BaseName -match '^(?<user>.+?)_S-1-5-21-') {
-            $userNameGuess = $Matches['user']
-        }
-        else {
-            # Fallback: just use the folder name as-is
-            $userNameGuess = $folderLeaf
-        }
-
-        if ([string]::IsNullOrWhiteSpace($userNameGuess)) {
+        if (-not (Test-Path $ProfileRoot)) {
+            Add-LogMessage "Profile root not found: $ProfileRoot" "WARN"
             continue
         }
 
-        if ($debugLimit -gt 0) {
-            Write-Host "DEBUG MAP: $($file.FullName)  =>  User '$userNameGuess'"
-            $debugLimit--
-        }
+        Add-LogMessage "Scanning: $ProfileRoot" "INFO"
 
-        if (-not $userTable.ContainsKey($userNameGuess)) {
-            $userTable[$userNameGuess] = [PSCustomObject]@{
-                UserName       = $userNameGuess
-                ContainerCount = 0
-                ProfileSizeGB  = 0.0
-                OfficeSizeGB   = 0.0
-                TotalSizeGB    = 0.0
-                LastWriteTime  = $file.LastWriteTime
-                RootFolder     = $file.DirectoryName
-                ContainerFiles = @()
+        # All container files
+        $vhdFiles = Get-ChildItem -Path $ProfileRoot -Recurse -File -Filter *.vhd* -ErrorAction SilentlyContinue
+        Add-LogMessage "Found $($vhdFiles.Count) .vhd/.vhdx files under $ProfileRoot" "INFO"
+
+        foreach ($file in $vhdFiles) {
+            # Folder that contains the SID, e.g. vditest1_S-1-5-21-1602...
+            $folderLeaf = Split-Path $file.DirectoryName -Leaf
+            $userNameGuess = $null
+            $sidMatch = $null
+
+            # Pattern: username_S-1-5-21-...
+            if ($folderLeaf -match '^(?<user>.+?)_(?<sid>S-1-5-21-[\d-]+)') {
+                $userNameGuess = $Matches['user']
+                $sidMatch = $Matches['sid']
             }
-        }
+            elseif ($file.BaseName -match '^(?<user>.+?)_(?<sid>S-1-5-21-[\d-]+)') {
+                $userNameGuess = $Matches['user']
+                $sidMatch = $Matches['sid']
+            }
+            else {
+                # Fallback: just use the folder name as-is
+                $userNameGuess = $folderLeaf
+                $sidMatch = "Unknown"
+            }
 
-        $entry = $userTable[$userNameGuess]
+            if ([string]::IsNullOrWhiteSpace($userNameGuess)) {
+                continue
+            }
 
-        $entry.ContainerCount++
-        $entry.ContainerFiles += $file.FullName
+            if ($debugLimit -gt 0) {
+                Write-Host "DEBUG MAP: $($file.FullName)  =>  User '$userNameGuess', SID '$sidMatch'"
+                $debugLimit--
+            }
 
-        $sizeGB = [Math]::Round($file.Length / 1GB, 3)
+            if (-not $userTable.ContainsKey($userNameGuess)) {
+                $userTable[$userNameGuess] = [PSCustomObject]@{
+                    UserName       = $userNameGuess
+                    ContainerCount = 0
+                    ProfileSizeGB  = 0.0
+                    OfficeSizeGB   = 0.0
+                    TotalSizeGB    = 0.0
+                    LastWriteTime  = $file.LastWriteTime
+                    RootFolder     = $file.DirectoryName
+                    ContainerFiles = @()
+                    SIDs           = [System.Collections.Generic.HashSet[string]]::new()
+                    ProfileRoots   = [System.Collections.Generic.HashSet[string]]::new()
+                }
+            }
 
-        # Simple classification: Office vs Profile by filename
-        if ($file.Name -match 'odfc|office') {
-            $entry.OfficeSizeGB += $sizeGB
-        } else {
-            $entry.ProfileSizeGB += $sizeGB
-        }
+            $entry = $userTable[$userNameGuess]
 
-        $entry.TotalSizeGB = $entry.ProfileSizeGB + $entry.OfficeSizeGB
+            $entry.ContainerCount++
+            $entry.ContainerFiles += $file.FullName
 
-        if ($file.LastWriteTime -gt $entry.LastWriteTime) {
-            $entry.LastWriteTime = $file.LastWriteTime
-        }
+            # Track SIDs
+            if ($sidMatch) {
+                [void]$entry.SIDs.Add($sidMatch)
+            }
 
-        # RootFolder: keep the "highest" folder we see (first one)
-        if (-not $entry.RootFolder) {
-            $entry.RootFolder = $file.DirectoryName
+            # Track which roots this user appears in
+            [void]$entry.ProfileRoots.Add($ProfileRoot)
+
+            $sizeGB = [Math]::Round($file.Length / 1GB, 3)
+
+            # Simple classification: Office vs Profile by filename
+            if ($file.Name -match 'odfc|office') {
+                $entry.OfficeSizeGB += $sizeGB
+            } else {
+                $entry.ProfileSizeGB += $sizeGB
+            }
+
+            $entry.TotalSizeGB = $entry.ProfileSizeGB + $entry.OfficeSizeGB
+
+            if ($file.LastWriteTime -gt $entry.LastWriteTime) {
+                $entry.LastWriteTime = $file.LastWriteTime
+            }
+
+            # RootFolder: keep the "highest" folder we see (first one)
+            if (-not $entry.RootFolder) {
+                $entry.RootFolder = $file.DirectoryName
+            }
         }
     }
 
+    Add-LogMessage "Total unique users found: $($userTable.Count)" "INFO"
     return $userTable.Values | Sort-Object UserName
 }
 
@@ -121,7 +246,8 @@ function Rename-FSLogixProfileObject {
         $ProfileObject,
         [bool]$WhatIf = $true,
         [bool]$OnlyOdfc = $false,
-        [bool]$OnlyProfile = $false
+        [bool]$OnlyProfile = $false,
+        [bool]$CheckInUse = $true
     )
 
     $user = $ProfileObject.UserName
@@ -132,11 +258,12 @@ function Rename-FSLogixProfileObject {
         param($msg, $logFile)
         $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
         "$ts $msg" | Tee-Object -FilePath $logFile -Append | Out-Null
+        Add-LogMessage $msg "INFO"
     }
 
     LogLocal "Starting rename (retire) for '$user'" $log
     LogLocal "Containers (all types): $($ProfileObject.ContainerFiles.Count)" $log
-    LogLocal "Mode: WhatIf=$WhatIf, OnlyODFC=$OnlyOdfc, OnlyProfile=$OnlyProfile" $log
+    LogLocal "Mode: WhatIf=$WhatIf, OnlyODFC=$OnlyOdfc, OnlyProfile=$OnlyProfile, CheckInUse=$CheckInUse" $log
 
     # Decide which files to target
     $files = $ProfileObject.ContainerFiles
@@ -161,9 +288,18 @@ function Rename-FSLogixProfileObject {
         return $log
     }
 
+    $skippedInUse = @()
+
     foreach ($path in $files) {
         if (-not (Test-Path $path)) {
             LogLocal "Missing file (skip): $path" $log
+            continue
+        }
+
+        # Check if file is in use
+        if ($CheckInUse -and (Test-FileInUse -FilePath $path)) {
+            LogLocal "IN USE (skip): $path" $log
+            $skippedInUse += $path
             continue
         }
 
@@ -191,6 +327,10 @@ function Rename-FSLogixProfileObject {
                 LogLocal ("ERROR renaming {0}: {1}" -f $path, $_.Exception.Message) $log
             }
         }
+    }
+
+    if ($skippedInUse.Count -gt 0) {
+        LogLocal "Skipped $($skippedInUse.Count) in-use files" $log
     }
 
     LogLocal "Completed rename (retire) for '$user'" $log
@@ -235,7 +375,8 @@ function Update-RowHighlight {
         $ProfileObject,
         [bool]$HighlightEnabled,
         [double]$ThresholdGB,
-        [System.Drawing.Color]$DefaultColor
+        [System.Drawing.Color]$DefaultColor,
+        [System.Drawing.Color]$HighlightColor
     )
 
     if (-not $ProfileObject) {
@@ -252,10 +393,239 @@ function Update-RowHighlight {
     [void][double]::TryParse($ProfileObject.TotalSizeGB.ToString(), [ref]$size)
 
     if ($size -ge $ThresholdGB) {
-        $Row.DefaultCellStyle.BackColor = [System.Drawing.Color]::MistyRose
+        $Row.DefaultCellStyle.BackColor = $HighlightColor
     } else {
         $Row.DefaultCellStyle.BackColor = $DefaultColor
     }
+}
+
+# --------------------------------------------------------------------
+#  CSV Export helper
+# --------------------------------------------------------------------
+function Export-GridToCSV {
+    param(
+        [System.Windows.Forms.DataGridView]$Grid,
+        [string]$FilePath
+    )
+
+    $sb = [System.Text.StringBuilder]::new()
+
+    # Headers
+    $headers = @()
+    foreach ($col in $Grid.Columns) {
+        $headers += "`"$($col.HeaderText)`""
+    }
+    [void]$sb.AppendLine(($headers -join ","))
+
+    # Data rows
+    foreach ($row in $Grid.Rows) {
+        $values = @()
+        foreach ($cell in $row.Cells) {
+            $val = if ($cell.Value) { $cell.Value.ToString() } else { "" }
+            $val = $val -replace "`"", "`"`""
+            $values += "`"$val`""
+        }
+        [void]$sb.AppendLine(($values -join ","))
+    }
+
+    $sb.ToString() | Out-File -FilePath $FilePath -Encoding UTF8
+    Add-LogMessage "Exported $($Grid.Rows.Count) rows to $FilePath" "INFO"
+}
+
+# --------------------------------------------------------------------
+#  Rename Preview Dialog
+# --------------------------------------------------------------------
+function Show-RenamePreviewDialog {
+    param(
+        $SelectedProfiles,
+        [bool]$OnlyOdfc,
+        [bool]$OnlyProfile
+    )
+
+    $previewForm = New-Object System.Windows.Forms.Form
+    $previewForm.Text = "Rename Preview"
+    $previewForm.Size = New-Object System.Drawing.Size(800, 500)
+    $previewForm.StartPosition = "CenterParent"
+    $previewForm.FormBorderStyle = "Sizable"
+
+    $lblInfo = New-Object System.Windows.Forms.Label
+    $lblInfo.Text = "The following files will be renamed:"
+    $lblInfo.Location = New-Object System.Drawing.Point(10, 10)
+    $lblInfo.AutoSize = $true
+    $previewForm.Controls.Add($lblInfo)
+
+    $listView = New-Object System.Windows.Forms.ListView
+    $listView.Location = New-Object System.Drawing.Point(10, 35)
+    $listView.Size = New-Object System.Drawing.Size(760, 380)
+    $listView.View = "Details"
+    $listView.FullRowSelect = $true
+    $listView.GridLines = $true
+    $listView.Anchor = "Top,Left,Right,Bottom"
+
+    [void]$listView.Columns.Add("User", 100)
+    [void]$listView.Columns.Add("Current Path", 300)
+    [void]$listView.Columns.Add("New Path", 300)
+    [void]$listView.Columns.Add("Status", 60)
+
+    $previewForm.Controls.Add($listView)
+
+    $inUseCount = 0
+
+    foreach ($profile in $SelectedProfiles) {
+        $files = $profile.ContainerFiles
+
+        if ($OnlyOdfc) {
+            $files = $files | Where-Object { $_ -match 'odfc|office' }
+        }
+        if ($OnlyProfile) {
+            $files = $files | Where-Object { $_ -notmatch 'odfc|office' }
+        }
+
+        foreach ($path in $files) {
+            $dir  = Split-Path -Parent $path
+            $name = Split-Path -Leaf  $path
+            $base = [System.IO.Path]::GetFileNameWithoutExtension($name)
+            $ext  = [System.IO.Path]::GetExtension($name)
+            $newName = "{0}-old{1}" -f $base, $ext
+            $newPath = Join-Path $dir $newName
+
+            $status = "OK"
+            if (Test-FileInUse -FilePath $path) {
+                $status = "IN USE"
+                $inUseCount++
+            } elseif (Test-Path $newPath) {
+                $status = "EXISTS"
+            } elseif (-not (Test-Path $path)) {
+                $status = "MISSING"
+            }
+
+            $item = New-Object System.Windows.Forms.ListViewItem($profile.UserName)
+            [void]$item.SubItems.Add($path)
+            [void]$item.SubItems.Add($newPath)
+            [void]$item.SubItems.Add($status)
+
+            if ($status -eq "IN USE") {
+                $item.BackColor = [System.Drawing.Color]::LightCoral
+            } elseif ($status -ne "OK") {
+                $item.BackColor = [System.Drawing.Color]::LightYellow
+            }
+
+            [void]$listView.Items.Add($item)
+        }
+    }
+
+    $lblSummary = New-Object System.Windows.Forms.Label
+    $lblSummary.Text = "Total files: $($listView.Items.Count), In-use: $inUseCount"
+    $lblSummary.Location = New-Object System.Drawing.Point(10, 420)
+    $lblSummary.AutoSize = $true
+    $lblSummary.Anchor = "Bottom,Left"
+    $previewForm.Controls.Add($lblSummary)
+
+    $btnProceed = New-Object System.Windows.Forms.Button
+    $btnProceed.Text = "Proceed"
+    $btnProceed.Location = New-Object System.Drawing.Point(600, 420)
+    $btnProceed.Size = New-Object System.Drawing.Size(80, 28)
+    $btnProceed.Anchor = "Bottom,Right"
+    $btnProceed.DialogResult = [System.Windows.Forms.DialogResult]::OK
+    $previewForm.Controls.Add($btnProceed)
+
+    $btnCancel = New-Object System.Windows.Forms.Button
+    $btnCancel.Text = "Cancel"
+    $btnCancel.Location = New-Object System.Drawing.Point(690, 420)
+    $btnCancel.Size = New-Object System.Drawing.Size(80, 28)
+    $btnCancel.Anchor = "Bottom,Right"
+    $btnCancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+    $previewForm.Controls.Add($btnCancel)
+
+    $previewForm.AcceptButton = $btnProceed
+    $previewForm.CancelButton = $btnCancel
+
+    return $previewForm.ShowDialog()
+}
+
+# --------------------------------------------------------------------
+#  Apply Theme
+# --------------------------------------------------------------------
+function Apply-Theme {
+    param([string]$ThemeName)
+
+    $theme = $script:Themes[$ThemeName]
+    if (-not $theme) { return }
+
+    $script:CurrentTheme = $ThemeName
+
+    # Form
+    $form.BackColor = $theme.FormBackColor
+    $form.ForeColor = $theme.FormForeColor
+
+    # Apply to all controls recursively
+    function Apply-ToControl($ctrl) {
+        if ($ctrl -is [System.Windows.Forms.Label]) {
+            $ctrl.ForeColor = $theme.FormForeColor
+        }
+        elseif ($ctrl -is [System.Windows.Forms.Button]) {
+            $ctrl.BackColor = $theme.ButtonBackColor
+            $ctrl.ForeColor = $theme.ButtonForeColor
+            $ctrl.FlatStyle = 'Flat'
+            $ctrl.FlatAppearance.BorderColor = $theme.FormForeColor
+        }
+        elseif ($ctrl -is [System.Windows.Forms.TextBox]) {
+            $ctrl.BackColor = $theme.TextBoxBackColor
+            $ctrl.ForeColor = $theme.TextBoxForeColor
+        }
+        elseif ($ctrl -is [System.Windows.Forms.CheckBox]) {
+            $ctrl.ForeColor = $theme.FormForeColor
+        }
+        elseif ($ctrl -is [System.Windows.Forms.NumericUpDown]) {
+            $ctrl.BackColor = $theme.TextBoxBackColor
+            $ctrl.ForeColor = $theme.TextBoxForeColor
+        }
+        elseif ($ctrl -is [System.Windows.Forms.ComboBox]) {
+            $ctrl.BackColor = $theme.TextBoxBackColor
+            $ctrl.ForeColor = $theme.TextBoxForeColor
+        }
+        elseif ($ctrl -is [System.Windows.Forms.DataGridView]) {
+            $ctrl.BackgroundColor = $theme.GridBackColor
+            $ctrl.DefaultCellStyle.BackColor = $theme.GridBackColor
+            $ctrl.DefaultCellStyle.ForeColor = $theme.GridForeColor
+            $ctrl.ColumnHeadersDefaultCellStyle.BackColor = $theme.GridHeaderBackColor
+            $ctrl.ColumnHeadersDefaultCellStyle.ForeColor = $theme.GridHeaderForeColor
+            $ctrl.AlternatingRowsDefaultCellStyle.BackColor = $theme.GridAlternateRowColor
+            $ctrl.EnableHeadersVisualStyles = $false
+            $ctrl.GridColor = $theme.FormForeColor
+        }
+        elseif ($ctrl -is [System.Windows.Forms.SplitContainer]) {
+            $ctrl.BackColor = $theme.FormBackColor
+        }
+
+        # Recurse into child controls
+        if ($ctrl.Controls) {
+            foreach ($child in $ctrl.Controls) {
+                Apply-ToControl $child
+            }
+        }
+    }
+
+    foreach ($ctrl in $form.Controls) {
+        Apply-ToControl $ctrl
+    }
+
+    # Update log panel specifically
+    if ($script:txtLog) {
+        $script:txtLog.BackColor = $theme.LogPanelBackColor
+        $script:txtLog.ForeColor = $theme.LogPanelForeColor
+    }
+
+    # Store theme highlight color for row highlighting
+    $script:CurrentHighlightColor = $theme.HighlightColor
+    $script:DefaultRowBackColor = $theme.GridBackColor
+
+    # Refresh row highlights
+    if ($grid) {
+        Refresh-RowHighlights
+    }
+
+    Add-LogMessage "Applied theme: $ThemeName" "INFO"
 }
 
 # --------------------------------------------------------------------
@@ -263,36 +633,66 @@ function Update-RowHighlight {
 # --------------------------------------------------------------------
 $form = New-Object System.Windows.Forms.Form
 $form.Text = "FSLogix Profile Manager (Horizon IC) - v$appVersion"
-$form.Size = New-Object System.Drawing.Size(1000,700)
+$form.Size = New-Object System.Drawing.Size(1100, 800)
 $form.StartPosition = "CenterScreen"
 $form.AutoScaleMode = 'None'
 
-# --- Row 1: Profile Root + Load button + version label ---
+# --- Row 1: Profile Root + Load button + version label + Theme ---
 
 $lblRoot = New-Object System.Windows.Forms.Label
-$lblRoot.Text = "Profile Root:"
-$lblRoot.Location = New-Object System.Drawing.Point(10,15)
+$lblRoot.Text = "Profile Root(s):"
+$lblRoot.Location = New-Object System.Drawing.Point(10, 15)
 $lblRoot.AutoSize = $true
 $form.Controls.Add($lblRoot)
 
 $txtRoot = New-Object System.Windows.Forms.TextBox
-$txtRoot.Location = New-Object System.Drawing.Point(100,12)
-$txtRoot.Size = New-Object System.Drawing.Size(480,22)
+$txtRoot.Location = New-Object System.Drawing.Point(100, 12)
+$txtRoot.Size = New-Object System.Drawing.Size(480, 22)
 $txtRoot.Text = $DefaultProfileRoot
 $form.Controls.Add($txtRoot)
 
+$lblRootHint = New-Object System.Windows.Forms.Label
+$lblRootHint.Text = "(semicolon-separated for multiple)"
+$lblRootHint.Location = New-Object System.Drawing.Point(100, 36)
+$lblRootHint.AutoSize = $true
+$lblRootHint.ForeColor = [System.Drawing.Color]::Gray
+$lblRootHint.Font = New-Object System.Drawing.Font("Segoe UI", 7)
+$form.Controls.Add($lblRootHint)
+
 $btnLoad = New-Object System.Windows.Forms.Button
 $btnLoad.Text = "Load Profiles"
-$btnLoad.Location = New-Object System.Drawing.Point(590,10)
-$btnLoad.Size = New-Object System.Drawing.Size(120,28)
+$btnLoad.Location = New-Object System.Drawing.Point(590, 10)
+$btnLoad.Size = New-Object System.Drawing.Size(100, 28)
 $form.Controls.Add($btnLoad)
+
+$btnRescan = New-Object System.Windows.Forms.Button
+$btnRescan.Text = "Rescan"
+$btnRescan.Location = New-Object System.Drawing.Point(695, 10)
+$btnRescan.Size = New-Object System.Drawing.Size(70, 28)
+$form.Controls.Add($btnRescan)
 
 $lblVersion = New-Object System.Windows.Forms.Label
 $lblVersion.Text = "v$appVersion"
-$lblVersion.Location = New-Object System.Drawing.Point(730,15)
+$lblVersion.Location = New-Object System.Drawing.Point(780, 15)
 $lblVersion.AutoSize = $true
 $lblVersion.ForeColor = [System.Drawing.Color]::DarkGray
 $form.Controls.Add($lblVersion)
+
+# Theme selector
+$lblTheme = New-Object System.Windows.Forms.Label
+$lblTheme.Text = "Theme:"
+$lblTheme.Location = New-Object System.Drawing.Point(840, 15)
+$lblTheme.AutoSize = $true
+$form.Controls.Add($lblTheme)
+
+$cmbTheme = New-Object System.Windows.Forms.ComboBox
+$cmbTheme.Location = New-Object System.Drawing.Point(890, 12)
+$cmbTheme.Size = New-Object System.Drawing.Size(70, 22)
+$cmbTheme.DropDownStyle = "DropDownList"
+[void]$cmbTheme.Items.Add("Light")
+[void]$cmbTheme.Items.Add("Dark")
+$cmbTheme.SelectedIndex = 0
+$form.Controls.Add($cmbTheme)
 
 # --- GitHub Icon Button (Top Right) ---
 
@@ -311,8 +711,8 @@ try {
 }
 
 $btnGithub = New-Object System.Windows.Forms.Button
-$btnGithub.Location = New-Object System.Drawing.Point(920, 10)
-$btnGithub.Size     = New-Object System.Drawing.Size(28,28)
+$btnGithub.Location = New-Object System.Drawing.Point(1020, 10)
+$btnGithub.Size     = New-Object System.Drawing.Size(28, 28)
 $btnGithub.FlatStyle = 'Flat'
 $btnGithub.FlatAppearance.BorderSize = 0
 $btnGithub.BackColor = $form.BackColor
@@ -321,7 +721,7 @@ if ($GitHubImage -ne $null) {
     $btnGithub.Image = $GitHubImage
 } else {
     $btnGithub.Text = "GH"
-    $btnGithub.Font = New-Object System.Drawing.Font("Segoe UI",8,[System.Drawing.FontStyle]::Bold)
+    $btnGithub.Font = New-Object System.Drawing.Font("Segoe UI", 8, [System.Drawing.FontStyle]::Bold)
 }
 
 $btnGithub.Add_Click({
@@ -334,120 +734,193 @@ $form.Controls.Add($btnGithub)
 
 $lblFilter = New-Object System.Windows.Forms.Label
 $lblFilter.Text = "Filter (user):"
-$lblFilter.Location = New-Object System.Drawing.Point(10,50)
+$lblFilter.Location = New-Object System.Drawing.Point(10, 55)
 $lblFilter.AutoSize = $true
 $form.Controls.Add($lblFilter)
 
 $txtFilter = New-Object System.Windows.Forms.TextBox
-$txtFilter.Location = New-Object System.Drawing.Point(100,47)
-$txtFilter.Size = New-Object System.Drawing.Size(180,22)
+$txtFilter.Location = New-Object System.Drawing.Point(100, 52)
+$txtFilter.Size = New-Object System.Drawing.Size(150, 22)
 $form.Controls.Add($txtFilter)
 
 $btnApplyFilter = New-Object System.Windows.Forms.Button
 $btnApplyFilter.Text = "Apply Filter"
-$btnApplyFilter.Location = New-Object System.Drawing.Point(290,45)
-$btnApplyFilter.Size = New-Object System.Drawing.Size(100,26)
+$btnApplyFilter.Location = New-Object System.Drawing.Point(260, 50)
+$btnApplyFilter.Size = New-Object System.Drawing.Size(90, 26)
 $form.Controls.Add($btnApplyFilter)
 
 # Last-used filter
 $chkAge = New-Object System.Windows.Forms.CheckBox
 $chkAge.Text = "Last used >"
-$chkAge.Location = New-Object System.Drawing.Point(410,48)
+$chkAge.Location = New-Object System.Drawing.Point(360, 53)
 $chkAge.AutoSize = $true
 $form.Controls.Add($chkAge)
 
 $numAge = New-Object System.Windows.Forms.NumericUpDown
-$numAge.Location = New-Object System.Drawing.Point(510,47)
+$numAge.Location = New-Object System.Drawing.Point(455, 52)
 $numAge.Minimum = 1
 $numAge.Maximum = 3650
 $numAge.Value = 30
-$numAge.Size = New-Object System.Drawing.Size(60,22)
+$numAge.Size = New-Object System.Drawing.Size(50, 22)
 $form.Controls.Add($numAge)
 
 $lblDays = New-Object System.Windows.Forms.Label
 $lblDays.Text = "days"
-$lblDays.Location = New-Object System.Drawing.Point(575,50)
+$lblDays.Location = New-Object System.Drawing.Point(510, 55)
 $lblDays.AutoSize = $true
 $form.Controls.Add($lblDays)
 
 # WhatIf
 $chkWhatIf = New-Object System.Windows.Forms.CheckBox
 $chkWhatIf.Text = "WhatIf (simulate)"
-$chkWhatIf.Location = New-Object System.Drawing.Point(640,48)
+$chkWhatIf.Location = New-Object System.Drawing.Point(560, 53)
 $chkWhatIf.AutoSize = $true
 $chkWhatIf.Checked = $true
 $form.Controls.Add($chkWhatIf)
 
+# Check In Use
+$chkCheckInUse = New-Object System.Windows.Forms.CheckBox
+$chkCheckInUse.Text = "Skip in-use"
+$chkCheckInUse.Location = New-Object System.Drawing.Point(700, 53)
+$chkCheckInUse.AutoSize = $true
+$chkCheckInUse.Checked = $true
+$form.Controls.Add($chkCheckInUse)
+
 # Highlight big profiles
 $chkHighlight = New-Object System.Windows.Forms.CheckBox
 $chkHighlight.Text = "Highlight >"
-$chkHighlight.Location = New-Object System.Drawing.Point(720,48)
+$chkHighlight.Location = New-Object System.Drawing.Point(800, 53)
 $chkHighlight.AutoSize = $true
 $chkHighlight.Checked = $true
 $form.Controls.Add($chkHighlight)
 
 $numHighlight = New-Object System.Windows.Forms.NumericUpDown
-$numHighlight.Location = New-Object System.Drawing.Point(820,47)
+$numHighlight.Location = New-Object System.Drawing.Point(890, 52)
 $numHighlight.Minimum = 1
 $numHighlight.Maximum = 10000
 $numHighlight.Value = 20
-$numHighlight.Size = New-Object System.Drawing.Size(60,22)
+$numHighlight.Size = New-Object System.Drawing.Size(55, 22)
 $form.Controls.Add($numHighlight)
 
 $lblHighlightGb = New-Object System.Windows.Forms.Label
 $lblHighlightGb.Text = "GB"
-$lblHighlightGb.Location = New-Object System.Drawing.Point(885,50)
+$lblHighlightGb.Location = New-Object System.Drawing.Point(950, 55)
 $lblHighlightGb.AutoSize = $true
 $form.Controls.Add($lblHighlightGb)
+
+# --- Row 3: Export button ---
+$btnExport = New-Object System.Windows.Forms.Button
+$btnExport.Text = "Export CSV"
+$btnExport.Location = New-Object System.Drawing.Point(1000, 50)
+$btnExport.Size = New-Object System.Drawing.Size(80, 26)
+$form.Controls.Add($btnExport)
+
+# --- SplitContainer for Grid + Log Panel ---
+
+$splitContainer = New-Object System.Windows.Forms.SplitContainer
+$splitContainer.Location = New-Object System.Drawing.Point(10, 85)
+$splitContainer.Size = New-Object System.Drawing.Size(1060, 620)
+$splitContainer.Orientation = "Horizontal"
+$splitContainer.SplitterDistance = 480
+$splitContainer.Panel1MinSize = 200
+$splitContainer.Panel2MinSize = 80
+$splitContainer.Anchor = "Top,Left,Right,Bottom"
+$form.Controls.Add($splitContainer)
 
 # --- DataGrid ---
 
 $grid = New-Object System.Windows.Forms.DataGridView
-$grid.Location = New-Object System.Drawing.Point(10,80)
-$grid.Size = New-Object System.Drawing.Size(960,520)
+$grid.Location = New-Object System.Drawing.Point(0, 0)
+$grid.Dock = "Fill"
 $grid.AllowUserToAddRows = $false
 $grid.AllowUserToDeleteRows = $false
 $grid.ReadOnly = $true
 $grid.MultiSelect = $true
 $grid.SelectionMode = "FullRowSelect"
 $grid.AutoGenerateColumns = $false
-$form.Controls.Add($grid)
+$grid.AllowUserToOrderColumns = $true
+$splitContainer.Panel1.Controls.Add($grid)
 
 $script:DefaultRowBackColor = $grid.DefaultCellStyle.BackColor
+$script:CurrentHighlightColor = [System.Drawing.Color]::MistyRose
 
-function Add-Col([string]$header, [int]$width) {
+# Column sorting state
+$script:SortColumn = -1
+$script:SortAscending = $true
+
+function Add-Col([string]$header, [int]$width, [string]$sortMode = "Automatic") {
     $col = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
     $col.HeaderText = $header
     $col.Width = $width
+    $col.SortMode = [System.Windows.Forms.DataGridViewColumnSortMode]::$sortMode
     [void]$grid.Columns.Add($col)
 }
 
-Add-Col "User"          150  # col 0
-Add-Col "# Cont"         70  # col 1
-Add-Col "Profile GB"     90  # col 2
-Add-Col "Office GB"      90  # col 3
-Add-Col "Total GB"       90  # col 4
-Add-Col "Last Write"    150  # col 5
-Add-Col "Root Folder"   260  # col 6
+Add-Col "User"          120 "Programmatic"  # col 0
+Add-Col "# Cont"         60 "Programmatic"  # col 1
+Add-Col "Profile GB"     80 "Programmatic"  # col 2
+Add-Col "Office GB"      80 "Programmatic"  # col 3
+Add-Col "Total GB"       80 "Programmatic"  # col 4
+Add-Col "Last Write"    130 "Programmatic"  # col 5
+Add-Col "SIDs"          180 "Programmatic"  # col 6
+Add-Col "Root Folder"   280 "Programmatic"  # col 7
+
+# --- Log Panel ---
+
+$lblLog = New-Object System.Windows.Forms.Label
+$lblLog.Text = "Operation Log:"
+$lblLog.Location = New-Object System.Drawing.Point(0, 0)
+$lblLog.AutoSize = $true
+$splitContainer.Panel2.Controls.Add($lblLog)
+
+$script:txtLog = New-Object System.Windows.Forms.TextBox
+$script:txtLog.Location = New-Object System.Drawing.Point(0, 20)
+$script:txtLog.Multiline = $true
+$script:txtLog.ScrollBars = "Vertical"
+$script:txtLog.ReadOnly = $true
+$script:txtLog.Font = New-Object System.Drawing.Font("Consolas", 9)
+$script:txtLog.Dock = "None"
+$script:txtLog.Anchor = "Top,Left,Right,Bottom"
+$script:txtLog.Size = New-Object System.Drawing.Size(1060, 100)
+$splitContainer.Panel2.Controls.Add($script:txtLog)
+
+# Adjust log panel size on split
+$splitContainer.Add_SplitterMoved({
+    $script:txtLog.Size = New-Object System.Drawing.Size($splitContainer.Panel2.Width, ($splitContainer.Panel2.Height - 25))
+})
+
+$btnClearLog = New-Object System.Windows.Forms.Button
+$btnClearLog.Text = "Clear"
+$btnClearLog.Location = New-Object System.Drawing.Point(100, 0)
+$btnClearLog.Size = New-Object System.Drawing.Size(50, 20)
+$splitContainer.Panel2.Controls.Add($btnClearLog)
+
+$btnClearLog.Add_Click({
+    $script:txtLog.Clear()
+    $script:LogMessages.Clear()
+})
 
 # --- Bottom row: status + profile/office-only + Reset/Close ---
 
 $lblStatus = New-Object System.Windows.Forms.Label
-$lblStatus.Location = New-Object System.Drawing.Point(10,615)
-$lblStatus.Size = New-Object System.Drawing.Size(360,20)
+$lblStatus.Location = New-Object System.Drawing.Point(10, 715)
+$lblStatus.Size = New-Object System.Drawing.Size(360, 20)
 $lblStatus.Text = "Ready."
+$lblStatus.Anchor = "Bottom,Left"
 $form.Controls.Add($lblStatus)
 
 $chkDeleteOdfc = New-Object System.Windows.Forms.CheckBox
 $chkDeleteOdfc.Text = "Only ODFC (Office) containers"
-$chkDeleteOdfc.Location = New-Object System.Drawing.Point(380,615)
+$chkDeleteOdfc.Location = New-Object System.Drawing.Point(380, 715)
 $chkDeleteOdfc.AutoSize = $true
+$chkDeleteOdfc.Anchor = "Bottom,Left"
 $form.Controls.Add($chkDeleteOdfc)
 
 $chkDeleteProfile = New-Object System.Windows.Forms.CheckBox
 $chkDeleteProfile.Text = "Only Profile containers"
-$chkDeleteProfile.Location = New-Object System.Drawing.Point(620,615)
+$chkDeleteProfile.Location = New-Object System.Drawing.Point(580, 715)
 $chkDeleteProfile.AutoSize = $true
+$chkDeleteProfile.Anchor = "Bottom,Left"
 $form.Controls.Add($chkDeleteProfile)
 
 # Ensure mutual exclusivity
@@ -459,16 +932,26 @@ $chkDeleteProfile.Add_CheckedChanged({
     if ($chkDeleteProfile.Checked) { $chkDeleteOdfc.Checked = $false }
 })
 
+$chkPreview = New-Object System.Windows.Forms.CheckBox
+$chkPreview.Text = "Preview"
+$chkPreview.Location = New-Object System.Drawing.Point(750, 715)
+$chkPreview.AutoSize = $true
+$chkPreview.Checked = $true
+$chkPreview.Anchor = "Bottom,Left"
+$form.Controls.Add($chkPreview)
+
 $btnDelete = New-Object System.Windows.Forms.Button
 $btnDelete.Text = "Reset Profile"
-$btnDelete.Location = New-Object System.Drawing.Point(800,610)
-$btnDelete.Size = New-Object System.Drawing.Size(100,28)
+$btnDelete.Location = New-Object System.Drawing.Point(850, 710)
+$btnDelete.Size = New-Object System.Drawing.Size(100, 28)
+$btnDelete.Anchor = "Bottom,Right"
 $form.Controls.Add($btnDelete)
 
 $btnClose = New-Object System.Windows.Forms.Button
 $btnClose.Text = "Close"
-$btnClose.Location = New-Object System.Drawing.Point(910,610)
-$btnClose.Size = New-Object System.Drawing.Size(60,28)
+$btnClose.Location = New-Object System.Drawing.Point(960, 710)
+$btnClose.Size = New-Object System.Drawing.Size(60, 28)
+$btnClose.Anchor = "Bottom,Right"
 $form.Controls.Add($btnClose)
 
 # Hold all profile objects
@@ -491,7 +974,17 @@ function Show-ProfilesInGrid {
         $row.Cells[3].Value = $p.OfficeSizeGB
         $row.Cells[4].Value = $p.TotalSizeGB
         $row.Cells[5].Value = $p.LastWriteTime
-        $row.Cells[6].Value = $p.RootFolder
+
+        # SID column - show abbreviated SIDs
+        $sidList = @($p.SIDs)
+        if ($sidList.Count -le 2) {
+            $row.Cells[6].Value = ($sidList -join "; ")
+        } else {
+            $row.Cells[6].Value = "$($sidList[0]); ... (+$($sidList.Count - 1) more)"
+        }
+        $row.Cells[6].ToolTipText = ($sidList -join "`n")
+
+        $row.Cells[7].Value = $p.RootFolder
 
         # Store the object on the row for later use
         $row.Tag = $p
@@ -500,7 +993,8 @@ function Show-ProfilesInGrid {
                             -ProfileObject $p `
                             -HighlightEnabled $chkHighlight.Checked `
                             -ThresholdGB ([double]$numHighlight.Value) `
-                            -DefaultColor $script:DefaultRowBackColor
+                            -DefaultColor $script:DefaultRowBackColor `
+                            -HighlightColor $script:CurrentHighlightColor
     }
 }
 
@@ -514,18 +1008,68 @@ function Refresh-RowHighlights {
                             -ProfileObject $obj `
                             -HighlightEnabled $chkHighlight.Checked `
                             -ThresholdGB ([double]$numHighlight.Value) `
-                            -DefaultColor $script:DefaultRowBackColor
+                            -DefaultColor $script:DefaultRowBackColor `
+                            -HighlightColor $script:CurrentHighlightColor
     }
 }
 
-# Load button
-$btnLoad.Add_Click({
+# Column header click for sorting
+$grid.Add_ColumnHeaderMouseClick({
+    param($sender, $e)
+
+    $colIndex = $e.ColumnIndex
+
+    # Toggle sort direction if same column
+    if ($script:SortColumn -eq $colIndex) {
+        $script:SortAscending = -not $script:SortAscending
+    } else {
+        $script:SortColumn = $colIndex
+        $script:SortAscending = $true
+    }
+
+    # Get current filtered profiles
+    $profiles = @()
+    foreach ($row in $grid.Rows) {
+        if ($row.Tag) { $profiles += $row.Tag }
+    }
+
+    # Sort based on column
+    $sorted = switch ($colIndex) {
+        0 { $profiles | Sort-Object UserName }
+        1 { $profiles | Sort-Object ContainerCount }
+        2 { $profiles | Sort-Object ProfileSizeGB }
+        3 { $profiles | Sort-Object OfficeSizeGB }
+        4 { $profiles | Sort-Object TotalSizeGB }
+        5 { $profiles | Sort-Object LastWriteTime }
+        6 { $profiles | Sort-Object { ($_.SIDs | Measure-Object).Count } }
+        7 { $profiles | Sort-Object RootFolder }
+        default { $profiles }
+    }
+
+    if (-not $script:SortAscending) {
+        [array]::Reverse($sorted)
+    }
+
+    Show-ProfilesInGrid $sorted
+
+    # Update column header to show sort indicator
+    foreach ($col in $grid.Columns) {
+        $col.HeaderCell.SortGlyphDirection = "None"
+    }
+    $grid.Columns[$colIndex].HeaderCell.SortGlyphDirection = if ($script:SortAscending) { "Ascending" } else { "Descending" }
+
+    Add-LogMessage "Sorted by column $($grid.Columns[$colIndex].HeaderText) $(if($script:SortAscending){'ascending'}else{'descending'})" "INFO"
+})
+
+# Load profiles function (shared by Load and Rescan)
+function Load-Profiles {
     try {
         $lblStatus.Text = "Loading..."
         $form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+        Add-LogMessage "Loading profiles..." "INFO"
 
-        $root = $txtRoot.Text.Trim()
-        $script:AllProfiles = Get-FSLogixProfiles -ProfileRoot $root
+        $roots = $txtRoot.Text -split ';' | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+        $script:AllProfiles = Get-FSLogixProfiles -ProfileRoots $roots
 
         $filtered = Apply-Filters -Source $script:AllProfiles `
                                   -UserFilter $txtFilter.Text `
@@ -533,15 +1077,26 @@ $btnLoad.Add_Click({
                                   -AgeDays ([int]$numAge.Value)
 
         Show-ProfilesInGrid $filtered
-        $lblStatus.Text = "Loaded $($filtered.Count) user(s)"
+        $lblStatus.Text = "Loaded $($filtered.Count) user(s) from $($roots.Count) root(s)"
+        Add-LogMessage "Loaded $($filtered.Count) user(s)" "INFO"
     }
     catch {
         [System.Windows.Forms.MessageBox]::Show("Error: $($_.Exception.Message)")
         $lblStatus.Text = "Error loading profiles."
+        Add-LogMessage "Error: $($_.Exception.Message)" "ERROR"
     }
     finally {
         $form.Cursor = [System.Windows.Forms.Cursors]::Default
     }
+}
+
+# Load button
+$btnLoad.Add_Click({ Load-Profiles })
+
+# Rescan button (same as load, but logs differently)
+$btnRescan.Add_Click({
+    Add-LogMessage "Manual rescan triggered" "INFO"
+    Load-Profiles
 })
 
 # Apply Filter
@@ -555,11 +1110,35 @@ $btnApplyFilter.Add_Click({
 
     Show-ProfilesInGrid $filtered
     $lblStatus.Text = "Filter: $($filtered.Count) user(s)"
+    Add-LogMessage "Filter applied: $($filtered.Count) user(s) match" "INFO"
 })
 
 # Re-apply highlights when highlight options change
 $chkHighlight.Add_CheckedChanged({ Refresh-RowHighlights })
 $numHighlight.Add_ValueChanged({ Refresh-RowHighlights })
+
+# Theme change
+$cmbTheme.Add_SelectedIndexChanged({
+    Apply-Theme $cmbTheme.SelectedItem.ToString()
+})
+
+# Export CSV
+$btnExport.Add_Click({
+    if ($grid.Rows.Count -eq 0) {
+        [System.Windows.Forms.MessageBox]::Show("No data to export.")
+        return
+    }
+
+    $saveDialog = New-Object System.Windows.Forms.SaveFileDialog
+    $saveDialog.Filter = "CSV files (*.csv)|*.csv|All files (*.*)|*.*"
+    $saveDialog.DefaultExt = "csv"
+    $saveDialog.FileName = "FSLogix_Export_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+
+    if ($saveDialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+        Export-GridToCSV -Grid $grid -FilePath $saveDialog.FileName
+        [System.Windows.Forms.MessageBox]::Show("Exported to:`n$($saveDialog.FileName)")
+    }
+})
 
 # Reset Profile (Retire / rename) Selected
 $btnDelete.Add_Click({
@@ -572,41 +1151,65 @@ $btnDelete.Add_Click({
     $whatIf = $chkWhatIf.Checked
     $onlyOdfc = $chkDeleteOdfc.Checked
     $onlyProfile = $chkDeleteProfile.Checked
+    $checkInUse = $chkCheckInUse.Checked
+    $showPreview = $chkPreview.Checked
 
-    $modeText = if ($onlyOdfc) {
-        "ODFC/Office containers only"
-    } elseif ($onlyProfile) {
-        "Profile containers only"
-    } else {
-        "ALL containers for selected users"
+    # Gather selected profiles
+    $selectedProfiles = @()
+    foreach ($row in $grid.SelectedRows) {
+        if ($row.Tag) { $selectedProfiles += $row.Tag }
     }
 
-    $resp = [System.Windows.Forms.MessageBox]::Show(
-        "Reset profile (retire/rename containers) for $count user(s)?`n`nMode: $modeText`nWhatIf = $whatIf`n`nContainers will be renamed to *-old.vhd(x).",
-        "Confirm Reset Profile",
-        [System.Windows.Forms.MessageBoxButtons]::YesNo
-    )
+    # Show preview dialog if enabled
+    if ($showPreview) {
+        $previewResult = Show-RenamePreviewDialog -SelectedProfiles $selectedProfiles -OnlyOdfc $onlyOdfc -OnlyProfile $onlyProfile
+        if ($previewResult -ne [System.Windows.Forms.DialogResult]::OK) {
+            Add-LogMessage "Rename cancelled from preview dialog" "INFO"
+            return
+        }
+    } else {
+        # Standard confirmation
+        $modeText = if ($onlyOdfc) {
+            "ODFC/Office containers only"
+        } elseif ($onlyProfile) {
+            "Profile containers only"
+        } else {
+            "ALL containers for selected users"
+        }
 
-    if ($resp -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+        $resp = [System.Windows.Forms.MessageBox]::Show(
+            "Reset profile (retire/rename containers) for $count user(s)?`n`nMode: $modeText`nWhatIf = $whatIf`nSkip in-use = $checkInUse`n`nContainers will be renamed to *-old.vhd(x).",
+            "Confirm Reset Profile",
+            [System.Windows.Forms.MessageBoxButtons]::YesNo
+        )
+
+        if ($resp -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+    }
+
+    Add-LogMessage "Starting rename operation for $count user(s)" "INFO"
 
     $logs = @()
 
-    foreach ($row in $grid.SelectedRows) {
-        $obj = $row.Tag
-        if (-not $obj) { continue }
-
-        $logFile = Rename-FSLogixProfileObject -ProfileObject $obj -WhatIf:$whatIf -OnlyOdfc:$onlyOdfc -OnlyProfile:$onlyProfile
+    foreach ($obj in $selectedProfiles) {
+        $logFile = Rename-FSLogixProfileObject -ProfileObject $obj -WhatIf:$whatIf -OnlyOdfc:$onlyOdfc -OnlyProfile:$onlyProfile -CheckInUse:$checkInUse
         $logs += $logFile
     }
 
     [System.Windows.Forms.MessageBox]::Show("Completed. Logs:`n`n$($logs -join "`n")")
 
     # Reload to reflect renames
-    $btnLoad.PerformClick()
+    Load-Profiles
 })
 
 # Close
 $btnClose.Add_Click({ $form.Close() })
+
+# Apply initial theme
+Apply-Theme "Light"
+
+# Initial log message
+Add-LogMessage "FSLogix Profile Manager v$appVersion started" "INFO"
+Add-LogMessage "Ready. Enter profile root path(s) and click 'Load Profiles'" "INFO"
 
 # Run
 [void]$form.ShowDialog()

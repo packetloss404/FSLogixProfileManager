@@ -1,5 +1,92 @@
 # FSLogix Profile Manager – Changelog
 
+## v0.6.0 – Major Feature Release
+
+This release implements all planned v0.6 features, significantly expanding the tool's capabilities.
+
+### New Features
+
+1. **SID Column with Per-User Breakdown**
+   - New "SIDs" column in the grid showing aggregated SIDs per user
+   - Abbreviated display for users with many SIDs (e.g., "S-1-5-21-xxx; ... (+3 more)")
+   - Full SID list available via tooltip on hover
+   - Tracks which profile roots each user appears in (for multi-root scenarios)
+
+2. **CSV Export**
+   - New "Export CSV" button in the toolbar
+   - Exports current filtered grid view to CSV file
+   - Includes all columns: User, Container Count, Profile GB, Office GB, Total GB, Last Write, SIDs, Root Folder
+   - Proper CSV escaping for values containing commas or quotes
+
+3. **Per-Column Sorting**
+   - Click any column header to sort ascending/descending
+   - Sort indicator (glyph) shows current sort direction
+   - Sorts by appropriate data type (numeric for sizes, date for Last Write, count for SIDs)
+   - Persists sort across filter operations
+
+4. **Multi-Root / Cloud Cache Support**
+   - Profile Root field now accepts semicolon-separated paths
+   - Example: `\\server1\profiles;\\server2\profiles`
+   - Merges results from all roots, aggregating by username
+   - Tracks which roots each user's containers came from
+   - Hint text below the input field explains the format
+
+5. **Rename Preview Dialog**
+   - New "Preview" checkbox (enabled by default) next to Reset Profile button
+   - When enabled, shows a detailed preview before any rename operation
+   - Lists all files with: User, Current Path, New Path, Status
+   - Status indicators: OK (green), IN USE (red), EXISTS (yellow), MISSING (yellow)
+   - Summary shows total files and count of in-use files
+   - Proceed or Cancel from the preview dialog
+
+6. **Open-Handle Detection**
+   - New "Skip in-use" checkbox (enabled by default)
+   - Detects if VHD/VHDX files are currently mounted or locked
+   - In-use files are highlighted in the preview dialog
+   - When enabled, skips in-use files during rename (logs them as skipped)
+   - Uses file system lock detection via exclusive open attempt
+
+7. **Light/Dark Theme Support**
+   - New Theme dropdown in the toolbar (Light/Dark)
+   - Light theme: Traditional light background with dark text
+   - Dark theme: Dark gray background with light text, optimized for low-light environments
+   - Theme applies to: form, grid, buttons, text boxes, checkboxes, log panel
+   - Highlight colors adjust per theme (MistyRose for light, dark red for dark)
+
+8. **Embedded Logging Panel**
+   - Resizable log panel at the bottom of the window (drag splitter to resize)
+   - Real-time operation logging with timestamps
+   - Log levels: INFO, WARN, ERROR
+   - "Clear" button to reset the log
+   - Logs all operations: load, filter, sort, export, rename actions
+   - Keeps last 500 messages in memory
+   - Monospace font (Consolas) for readability
+
+9. **Manual Rescan Button**
+   - New "Rescan" button next to "Load Profiles"
+   - Rescans all configured roots without restarting the tool
+   - Useful after external changes to the profile storage
+   - Logs the rescan action
+
+### UI Changes
+
+- Window size increased to 1100x800 to accommodate new features
+- SplitContainer divides the main grid from the log panel
+- Grid now has 8 columns (added SIDs column)
+- Controls repositioned for the wider layout
+- All controls properly anchored for window resizing
+
+### Technical Improvements
+
+- `Get-FSLogixProfiles` now accepts array of profile roots
+- Profile objects now include `SIDs` (HashSet) and `ProfileRoots` (HashSet) properties
+- `Rename-FSLogixProfileObject` now accepts `-CheckInUse` parameter
+- New helper functions: `Test-FileInUse`, `Get-InUseContainers`, `Export-GridToCSV`, `Add-LogMessage`, `Apply-Theme`
+- Theme definitions stored in `$script:Themes` hashtable for easy customization
+- Log messages stored in `$script:LogMessages` ArrayList
+
+---
+
 ## v0.5.2 (rev2)  – GitHub/About button & UI polish
 
 - Added a **GitHub/About button** in the top-right corner of the main window:
@@ -115,23 +202,29 @@
 
 ---
 
-## Planned for v0.6 (not yet implemented)
+## Planned for v0.7 (future considerations)
 
-- Optional **SID column** or per-folder breakdown:
-  - Show which SIDs/folders are aggregated per user.
-- **CSV export**:
-  - Export the current grid (with filters applied) to CSV for reporting.
-- **Per-column sorting**:
-  - Enable clicking on grid headers to sort by username, size, last write, etc.
-- **Multi-root / Cloud Cache support**:
-  - Allow specifying multiple FSLogix roots and merging results.
-- **Advanced delete/rename preview**:
-  - A dialog to review the exact rename plan (old → new paths) before confirming.
-- **Open-handle detection**:
-  - Attempt to detect in-use containers and warn before renaming.
-- **Theming**:
-  - Light/dark mode presets or basic color customization.
-- **Logging panel inside the UI**:
-  - Embedded view of recent log lines, with per-user operation summaries.
-- **Manual rescan button**:
-  - Explicit UI control to rescan the FSLogix roots without restarting the tool.
+- **Scheduled/automated operations**: Run rename operations on a schedule
+- **Profile size trending**: Track profile growth over time
+- **Active Directory integration**: Look up user details from AD
+- **Batch operations file**: Import/export list of users to process
+- **Custom rename patterns**: Configure the rename suffix (not just "-old")
+- **Undo/restore functionality**: Rename containers back from "-old" to original
+- **Profile compression stats**: Show VHD/VHDX internal vs allocated size
+- **Network share browser**: Browse for profile roots instead of typing paths
+- **Keyboard shortcuts**: Hotkeys for common operations
+
+---
+
+## v0.6 Features (Implemented in v0.6.0)
+
+All originally planned v0.6 features have been implemented:
+- ✅ SID column with per-folder breakdown
+- ✅ CSV export
+- ✅ Per-column sorting
+- ✅ Multi-root / Cloud Cache support
+- ✅ Advanced rename preview dialog
+- ✅ Open-handle detection
+- ✅ Light/Dark theming
+- ✅ Embedded logging panel
+- ✅ Manual rescan button
