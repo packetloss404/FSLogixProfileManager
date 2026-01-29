@@ -165,7 +165,63 @@ Then add the theme name to `$cmbTheme.Items` (lines 692-693).
 
 ## Version History
 
+- **v0.7.0**: Health monitoring - VHD health checks, disk space monitoring, orphan detection, status column, issues-only filter, color legend
 - **v0.6.0**: Major feature release - SID column, CSV export, column sorting, multi-root support, rename preview, open-handle detection, theming, embedded log panel, rescan button
 - **v0.5.2**: Profile-only/ODFC-only targeting, GitHub button
 - **v0.5.1**: Rename-based retire behavior (replaced delete)
 - **v0.5.0**: Initial FSLogix Horizon IC-focused build
+
+---
+
+## FSLogix Reset Profile CLI (Add-on)
+
+A CLI-only companion tool (`FSLogixResetProfile.ps1`) extracted from the GUI utility. Provides the same profile discovery, filtering, and rename logic without requiring WinForms or STA mode.
+
+### Running the CLI
+
+```powershell
+# Always start with -WhatIf to preview changes
+.\FSLogixResetProfile.ps1 -User <username> -WhatIf
+
+# Or use -ListOnly to see targets without generating logs
+.\FSLogixResetProfile.ps1 -User <username> -ListOnly
+
+# Execute actual reset (removes -WhatIf)
+.\FSLogixResetProfile.ps1 -User <username>
+```
+
+### CLI Architecture
+
+The script (`FSLogixResetProfile.ps1`) mirrors the GUI's core functions:
+
+1. **Profile Discovery (`Get-FSLogixProfiles`)**: Same recursive scan and user aggregation as the GUI. Parses `username_S-1-5-21-...` folder patterns, builds profile objects with container counts, sizes, and file paths.
+
+2. **Filtering (`Apply-Filters`)**: Applies `-User` (wildcard support, multi-value) and `-LastUsedDays` filters.
+
+3. **Rename Operations (`Rename-FSLogixProfileObject`)**: Same rename-to-`-old` logic. Supports `-OnlyOdfc` and `-OnlyProfile` switches. Generates per-user logs in `%TEMP%`.
+
+### CLI Parameters
+
+- `-ProfileRoot` – Override the default UNC path (`\\fml-fslogix\FSLogixUserProfiles`)
+- `-User` – Target specific users (supports wildcards and arrays)
+- `-LastUsedDays` – Filter to profiles not written to in N days
+- `-OnlyOdfc` – Reset only Office/ODFC containers
+- `-OnlyProfile` – Reset only Profile containers (excludes ODFC)
+- `-WhatIf` – Preview mode, no changes made
+- `-ListOnly` – Show targets and exit before rename
+
+### CLI Safety Mechanisms
+
+- Mutual exclusion: Cannot specify both `-OnlyOdfc` and `-OnlyProfile`
+- Skips rename if `*-old.vhd(x)` target already exists
+- Handles missing container files gracefully with logging
+- No deletion: All operations are rename-based
+
+### Testing CLI Changes
+
+1. Test with `-WhatIf` first to validate logic without making changes
+2. Use `-ListOnly` to verify filtering and discovery logic
+3. Test with a single user (`-User <testuser>`) before broader operations
+4. Verify log file generation in `%TEMP%` (pattern: `FSLogix_Rename_<username>_<timestamp>.log`)
+5. Test container type filtering with `-OnlyOdfc` and `-OnlyProfile`
+6. Test wildcard patterns (`-User vdi*`) and multi-value user filters

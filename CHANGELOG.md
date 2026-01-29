@@ -169,3 +169,42 @@ Window is bigger now (1100x800) to fit everything.
 - Keyboard shortcuts
 - VHD compaction (reclaim whitespace)
 - VHD repair (run chkdsk/Repair-Volume on containers)
+
+---
+
+# FSLogix Reset Profile CLI – Changelog
+
+## v1
+
+- Created the first **CLI-only** version of the FSLogix profile reset tool, extracted from the GUI-based Horizon IC utility.
+- Implemented scanning of an FSLogix profile root (default: `\\fml-fslogix\FSLogixUserProfiles`) for `*.vhd` / `*.vhdx` containers.
+- Implemented username detection based on folder naming pattern:
+  - `username_S-1-5-21-XXXXXXXXX-XXXXXXXXX-XXXXXXXXX-XXXXX`
+- Aggregated multiple containers per user into a single profile object:
+  - Tracks container count, Profile size (GB), Office/ODFC size (GB), total size (GB), last write time, root folder, and container file paths.
+- Added support for flexible targeting and filtering:
+  - `-User` parameter (supports wildcards and multiple values).
+  - `-LastUsedDays` parameter to filter by last write time (e.g., only profiles not touched in 30+ days).
+  - `-OnlyOdfc` switch to restrict operations to Office/ODFC containers (filenames matching `odfc` or `office`).
+  - `-OnlyProfile` switch to restrict operations to non-ODFC containers (main profile disks).
+  - `-ListOnly` switch to list matched profiles without performing any rename operations.
+- Implemented safe **rename-based** reset behavior:
+  - All operations rename container files from `Name.vhd(x)` to `Name-old.vhd(x)` rather than deleting them.
+  - Ensures a rollback path and avoids immediate data loss.
+- Added per-user logging:
+  - Each operation writes to `%TEMP%` using the pattern:
+    - `FSLogix_Rename_<username>_<YYYYMMDDHHMMSS>.log`
+  - Logs include:
+    - Selected mode (WhatIf, OnlyODFC, OnlyProfile).
+    - Number of containers discovered and filtered.
+    - Per-file actions (WHATIF messages or actual rename results).
+- Added `-WhatIf` support:
+  - When present, no files are renamed.
+  - Logs record `WHATIF: Would rename <oldPath> -> <newPath>` entries for review.
+- Implemented safety checks:
+  - Prevents use of `-OnlyOdfc` and `-OnlyProfile` at the same time (exits with an error).
+  - Skips rename if the `*-old.vhd(x)` target file already exists.
+  - Handles missing original files gracefully (logging and continue).
+- Added console output summary:
+  - Shows matched user profiles (username, container count, total size, last write time) before performing any changes.
+  - Echoes current settings: ProfileRoot, User filter, LastUsedDays, OnlyOdfc, OnlyProfile, WhatIf, and ListOnly.
