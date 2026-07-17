@@ -88,7 +88,6 @@ function Get-FSLogixProfiles {
     Write-Host "Found $($vhdFiles.Count) container file(s)." -ForegroundColor Green
 
     $userTable = @{}
-    $debugLimit = 10
 
     foreach ($file in $vhdFiles) {
         $folderLeaf = Split-Path $file.DirectoryName -Leaf
@@ -107,11 +106,6 @@ function Get-FSLogixProfiles {
         }
 
         if ([string]::IsNullOrWhiteSpace($userNameGuess)) { continue }
-
-        if ($debugLimit -gt 0) {
-            Write-Host ("DEBUG MAP: {0} => '{1}'" -f $file.FullName, $userNameGuess) -ForegroundColor DarkGray
-            $debugLimit--
-        }
 
         if (-not $userTable.ContainsKey($userNameGuess)) {
             $userTable[$userNameGuess] = [PSCustomObject]@{

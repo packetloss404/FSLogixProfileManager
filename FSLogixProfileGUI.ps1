@@ -275,7 +275,6 @@ function Get-FSLogixProfiles {
     )
 
     $userTable = @{}
-    $debugLimit = 10
 
     # Initialize AD check if orphan detection requested
     if ($CheckOrphans) {
@@ -320,11 +319,6 @@ function Get-FSLogixProfiles {
 
             if ([string]::IsNullOrWhiteSpace($userNameGuess)) {
                 continue
-            }
-
-            if ($debugLimit -gt 0) {
-                Write-Host "DEBUG MAP: $($file.FullName)  =>  User '$userNameGuess', SID '$sidMatch'"
-                $debugLimit--
             }
 
             $fileSizeGB = [Math]::Round($file.Length / 1GB, 3)
