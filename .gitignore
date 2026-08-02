@@ -1,0 +1,11 @@
+# Tool output — never commit operational logs or exports
+FSLogix_Rename_*.log
+FSLogix_Export_*.csv
+actions_*.csv
+
+# Windows / editor cruft
+Thumbs.db
+desktop.ini
+*.swp
+.vscode/
+.idea/

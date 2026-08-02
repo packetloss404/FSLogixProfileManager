@@ -1,5 +1,51 @@
 # FSLogix Profile Manager – Changelog
 
+## Unreleased
+
+Groundwork for v0.8.0. **No behaviour change yet** — the GUI and CLI are still the
+v0.7.0 scripts and do not import the new module.
+
+**New: `FSLogixProfileCore.psm1`** – the scan, classify, filter, retire, restore and
+purge core, extracted so the GUI and CLI stop maintaining two diverged copies. No
+WinForms dependency, so it can run in a background runspace.
+
+Fixed in the core (see `BACKLOG.md` for the full audit):
+
+- Retired `*-old` containers are no longer re-scanned or re-renamed. Previously a
+  second reset skipped the *live* container (its `-old` target already existed) and
+  renamed the previous backup to `-old-old`, while reporting success.
+- `-Filter *.vhd*` is a prefix match, so Cloud Cache `.meta` / `.metadata` / `.lock`
+  sidecars were counted as containers and renamed. Now filtered on real extension.
+- Retire suffix is now `-old-yyyyMMdd-HHmmss`, which cannot collide, groups a batch,
+  and records when a container was retired.
+- SID-first folder names (FSLogix's *default* `FlipFlopProfileDirectoryName` layout)
+  now parse. Previously nothing matched, and the AD check flagged every profile in
+  the estate as ORPHAN.
+- Container type is classified by positive filename prefix (`Profile_`, `ODFC_`,
+  `O365_`) at discovery. The old `odfc|office` regex ran against the full path in the
+  retire and preview paths, inverting `-OnlyProfile` / `-OnlyOdfc` on a dedicated
+  Office share, and misclassified `O365_*.vhdx`.
+- Orphan detection binds by SID, not by the folder-derived sAMAccountName, so renamed
+  and trusted-domain users are no longer flagged as orphans.
+- A share with exactly one user no longer breaks discovery (scalar unrolling).
+- `Max GB` and `NEAR_LIMIT` come from a real ceiling (Get-VHD or registry
+  `SizeInMBs`) or are left blank — no more guessing from a hardcoded size list.
+- In-use detection distinguishes Free / InUse / AccessDenied / Missing, and prefers
+  `Get-SmbOpenFile` (which also names the holding user and machine).
+
+Added in the core: audit trail, batch restore, retired-container report and gated
+purge, optional Horizon session gate, FSLogix registry policy reader, Cloud Cache
+replica handling with all-or-nothing retire.
+
+**New: `tests/Test-FSLogixProfileCore.ps1`** – 30 checks over the pure logic and a
+synthetic share. No AD, Hyper-V, Horizon or network required.
+
+**New: `.gitignore`** – keeps `FSLogix_Rename_*.log` and exported CSVs out of the repo.
+
+Also: absorbed `FSLogixResetProfile.ps1` into this repo (`5d0d08b`) and removed
+leftover DEBUG MAP scaffolding from both scripts (`21ba003`) — neither was recorded
+here at the time.
+
 ## v0.7.0
 
 Health monitoring update. The tool now catches problems before they bite you.
