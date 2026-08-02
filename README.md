@@ -1,6 +1,9 @@
-# FSLogix Profile Manager (Horizon IC) – v0.7.0
+# FSLogix Profile Manager (Horizon IC) – v0.8.0
 
-A WinForms-based PowerShell GUI tool for managing FSLogix user profile containers in VMware Horizon Instant Clones environments. It provides a safe way to retire/reset user profiles by renaming containers rather than deleting them.
+A WinForms PowerShell GUI and a matching CLI for managing FSLogix user profile
+containers in VMware Horizon Instant Clones environments. Retires (renames)
+containers rather than deleting them, so a bad reset is reversible from the
+Retired dialog.
 
 Containers are stored under UNC paths like:
 
@@ -9,66 +12,105 @@ Containers are stored under UNC paths like:
     username_S-1-5-21-XXXXXXXXX-XXXXXXXXX-XXXXXXXXX-XXXXX\*.vhdx
 ```
 
-Multiple semicolon-separated paths are supported for Cloud Cache setups. Each `username_S-1-5-21-...` folder is treated as a single user profile root, and all `*.vhd` / `*.vhdx` containers beneath it are discovered and aggregated.
+Multiple semicolon-separated paths are supported for Cloud Cache setups. Each
+`username_S-1-5-21-...` folder is treated as a single user profile root, and
+all `*.vhd` / `*.vhdx` containers beneath it are discovered and aggregated.
+
+> **v0.8.0 changes**: the GUI and CLI now share a single core module
+> (`FSLogixProfileCore.psm1`). The two diverged copies of scan/filter/retire
+> logic are gone, and the new features (audit, batch restore, retired
+> report, Horizon gate, AD last-logon, move-to-retired) are wired in.
 
 ---
 
 ## Core Features
 
-- Enumerates all `*.vhd` / `*.vhdx` FSLogix containers under one or more root shares.
-- Derives usernames and SIDs from folder names with pattern `username_S-1-5-21-...`.
-- Aggregates multiple containers (Profile, ODFC/Office, extra SIDs) into a single row per user.
-- Displays per-user: Username, Container count, Profile size (GB), Office/ODFC size (GB), Total size (GB), Used GB, Max GB, Last write time, SIDs, Status, Root folder.
-- **Column sorting** – click headers to sort; click again to reverse.
-- **CSV export** – export the current filtered view to CSV.
+- Enumerates all `*.vhd` / `*.vhdx` FSLogix containers under one or more root
+  shares.
+- Derives usernames and SIDs from folder names for both FlipFlop orders
+  (`username_SID` and `SID_username`) and from the filename under the
+  `NoProfileContainingFolder` layout.
+- Aggregates multiple containers (Profile, ODFC/Office, extra SIDs) into one
+  row per user.
+- Grid columns: User, # Cont, Size (GB), Max GB, Office GB, Last Write,
+  Status, SIDs, AD Last Logon, Root Folder.
+- **Column sorting** – click headers; sort glyph persists across
+  filter/rescan. Status and SIDs sort by displayed text, not count.
+- **CSV export** – full SIDs, respects column reorder, drops the truncated
+  `(... +N more)` cell.
 - **Filtering:**
-  - Filter by username (substring match).
-  - Filter by "Last used > X days".
-  - Show only profiles with issues (Issues Only filter).
+  - Filter by username (substring; brackets escape).
+  - Filter by "Last used > X days" (on-disk mtime).
+  - Filter by "AD last logon > X days" (`lastLogonTimestamp`).
+  - Issues-only filter.
 - **Reset Profile modes:**
-  - **WhatIf (simulate)** mode (on by default).
-  - **Only ODFC (Office) containers** mode.
-  - **Only Profile containers** mode.
+  - **WhatIf (simulate)** – default for the GUI; required for any
+    non-WhatIf CLI run via `-WhatIf` or by typing a count.
+  - **Only ODFC (Office)** / **Only Profile** checkboxes map to `-Scope
+    Office` / `-Scope Profile` in the module.
   - Reset all containers (Profile + Office) when both toggles are off.
-- **Rename preview** – modal dialog shows exactly what will happen before any rename.
-- **Open-handle detection** – "Skip in-use" checkbox (on by default) detects mounted VHDs before renaming.
+  - **Move to retired** (default on): retired files land under
+    `<root>\_retired\<user>\<batch-stamp>\` so they stop counting against
+    the user's FSRM quota and fall outside the user's ACL scope. Turn off
+    to fall back to the legacy in-place rename.
+- **Rename preview** – LIVE / SIMULATION banner at the top with operator,
+  user count, scope, in-use check status, and Horizon connection state.
+  The default action on the preview is Cancel, not Proceed.
+- **Reason / Ticket** – required text box for any live run. The reason
+  is written to the audit log on every renamed row.
+- **In-use detection** – "Skip in-use" is on by default. The tool tries
+  `Get-SmbOpenFile` first (names the holder); falls back to a local lock
+  probe.
+  > Open-handle detection is best-effort. A `ReadWrite` mount on a
+  > different file server, a Cloud Cache session, or a long-lived
+  > `OpenRead` lease can all show a container as "free" when it isn't.
+  > The InUse result is a strong signal; the Free result is a weak one.
 - **Health monitoring:**
-  - Status column: OK, CORRUPT, ORPHAN, NEAR_LIMIT, EMPTY, RETIRED.
-  - Disk space monitoring with Used GB / Max GB columns.
-  - Orphan detection via ADSI (no AD module needed).
-  - Color-coded rows with legend.
-- **Theming** – Light/Dark mode toggle.
-- **Embedded log panel** – resizable panel showing real-time activity.
-- **Row highlighting** – configurable threshold for Total GB highlighting.
-- **Logging** – per-user log files in `%TEMP%` (pattern: `FSLogix_Rename_username_YYYYMMDDHHMMSS.log`).
-
----
-
-## Rename (Retire) Behavior
-
-- The tool **does not delete** containers.
-- Instead, it renames them by appending `-old` before the extension:
-  - `Profile_username_SID.vhdx` → `Profile_username_SID-old.vhdx`
-  - `ODFC_username_SID.vhd` → `ODFC_username_SID-old.vhd`
-- When **WhatIf (simulate)** is enabled, no rename occurs; logs record `WHATIF: Would rename <oldPath> -> <newPath>`.
+  - Status column: OK, CORRUPT, BAD_SIGNATURE, ORPHAN, AD_DISABLED,
+    NEAR_LIMIT, OVER_LIMIT, EMPTY, HAS_RETIRED, UNPARSED_NAME.
+  - Row colouring: corrupt/orphan/near-limit use theme-aware colours
+    (dark variants for the Dark theme, not the original hard-coded
+    `LightCoral`).
+  - Disk space monitoring with Size (GB) / Max GB columns. Max GB is
+    blank unless Get-VHD or the registry's `SizeInMBs` is available.
+  - Orphan detection via ADSI (no AD module needed). Binds by SID first,
+    falls back to an escaped `sAMAccountName` filter.
+- **Theming** – Light / Dark mode toggle. Health colours re-theme.
+- **Embedded log panel** – resizable; `MaxLength = 0` so it no longer
+  silently dies at ~32 KB.
+- **Row highlighting** – configurable threshold for Size (GB). Health
+  issues win over the size highlight, so a CORRUPT row stays coral even
+  under a low threshold.
+- **Logging** – per-user log files in `%TEMP%` (pattern:
+  `FSLogix_Rename_<user>_<WHATIF|LIVE>_<stamp>.log`).
+- **Audit trail** – monthly append-only CSV under the configured root
+  (default `%ProgramData%\FSLogixProfileManager\Audit`). If a central
+  root was set explicitly via Settings, a failed write aborts the
+  operation.
+- **Retired dialog** – lists every retired container under the configured
+  roots, with an age filter, batch Restore and gated Purge (90-day
+  retention floor, refuses a last copy without `-AllowLastCopy`, refuses
+  legacy undated `-old` without `-IncludeUndated`).
+- **Background scan** – runs in a runspace; the UI shows a marquee
+  progress form with a Cancel button. No more "Not Responding".
 
 ---
 
 ## Requirements
 
 - Windows OS with PowerShell 5.1+.
-- .NET Windows Forms assemblies (standard on typical Windows installations).
-- Access to your FSLogix profile share (e.g. `\\fml-fslogix\FSLogixUserProfiles`).
-- Launch PowerShell in **STA** mode when running the GUI.
+- .NET Windows Forms assemblies (standard on Windows).
+- Access to your FSLogix profile share (e.g.
+  `\\fml-fslogix\FSLogixUserProfiles`).
+- Launch PowerShell in **STA** mode for the GUI.
 
 ---
 
 ## Getting Started
 
-1. Copy the scripts to a machine that has network access to your FSLogix share.
-
-2. Open an elevated PowerShell session (optional but recommended for rename/reset operations).
-
+1. Copy the scripts to a machine with network access to your FSLogix share.
+2. Open an elevated PowerShell session (recommended for rename/reset
+   operations).
 3. Run the GUI in STA mode:
 
    ```powershell
@@ -76,10 +118,19 @@ Multiple semicolon-separated paths are supported for Cloud Cache setups. Each `u
    ```
 
 4. In the GUI:
-   - Verify the **Profile Root** path (defaults to `\\fml-fslogix\FSLogixUserProfiles`).
+   - Verify the **Profile Root** path (defaults to
+     `\\fml-fslogix\FSLogixUserProfiles`).
    - Click **Load Profiles**.
-   - Use **Filter (user)** and **Last used > X days** as needed.
-   - Leave **WhatIf (simulate)** checked during initial testing.
+   - Use **Filter (user)**, **Older than** and **AD last logon** as
+     needed.
+   - **WhatIf** is on by default. Type a **Reason / Ticket** before
+     unchecking it.
+   - Use the **Horizon...** button to connect to a Connection Server
+     (optional).
+   - Use the **Retired...** button to inspect and restore/purge retired
+     containers.
+   - Use the **Set...** button to point the audit trail at a central
+     share.
 
 ---
 
@@ -87,90 +138,112 @@ Multiple semicolon-separated paths are supported for Cloud Cache setups. Each `u
 
 ### WhatIf Mode
 
-- When **WhatIf (simulate)** is checked:
-  - The tool does not rename any files.
-  - Instead, it logs what **would** have been renamed.
-  - Check `FSLogix_Rename_*.log` files in `%TEMP%` to review the plan.
+- When **WhatIf** is checked, no files are renamed. The run is logged
+  with `[WHATIF] Summary` and no audit row is written.
+- Read the per-user log in `%TEMP%` to review the plan.
 
 ### Reset ODFC (Office) only
 
-- Check **Only ODFC (Office) containers** to target only files matching `*odfc*` or `*office*`.
+- Check **Only ODFC** to target only the Office container for the
+  selected users.
 
 ### Reset main Profile only
 
-- Check **Only Profile containers** to target only non-ODFC containers.
+- Check **Only Profile** to target only the non-ODFC container.
 
 ### Reset all containers
 
-- Leave both checkboxes unchecked to rename all containers for the selected users.
+- Leave both checkboxes unchecked to rename every container for the
+  selected users.
 
-Always test with WhatIf enabled first.
+### Live run contract
+
+- A **Reason / Ticket** is required.
+- The Reset button reads **Reset Profile - LIVE** in red whenever
+  WhatIf is off.
+- The preview dialog is non-modal only at the source: the **Proceed**
+  button on the preview is not the default, and the confirmation that
+  follows it requires the operator to type the container count when the
+  selection is large.
+- A second full-share freeze never happens after a WhatIf run.
+- An audit row is written for every action. A failed write aborts the
+  operation when a central audit root was set.
 
 ---
 
 ## Row Highlighting
 
-- Turn on **Highlight >** to enable row highlighting.
-- Set the **GB** numeric value for the threshold (e.g., `20`).
-- Any user whose **Total GB >= threshold** will be highlighted with a distinct background color.
-- Uncheck **Highlight >** to disable highlighting entirely.
+- **Highlight >** uses the Size (GB) column. Any user whose Size (GB)
+  is at or above the threshold is highlighted with the theme's
+  highlight colour.
+- **Health wins over size.** A row with `CORRUPT`, `BAD_SIGNATURE`,
+  `ORPHAN`, `AD_DISABLED`, `NEAR_LIMIT` or `OVER_LIMIT` is coloured by
+  the health tier before the size threshold is checked, and stays that
+  colour even when the size highlight is disabled.
+
+---
+
+## FSLogix Reset Profile CLI
+
+The CLI (`FSLogixResetProfile.ps1`) is a thin shell over the same module
+the GUI uses. It does not have its own copies of scan/filter/retire
+logic.
+
+### Safety contract
+
+- A bare call with no filter is **refused outright**. Specify
+  `-User`, `-LastUsedDays`, or an explicit `-All`.
+- A live run uses `SupportsShouldProcess`; a `-WhatIf` run is the
+  default for any path that ends in a rename.
+- In-use checking is on by default. Pass `-CheckInUse:$false` to
+  disable (and accept the risk).
+- `-Force` allows retiring a row whose identity could not be parsed
+  out of the share layout.
+
+### Usage Examples
+
+```powershell
+# Dry run for one user.
+.\FSLogixResetProfile.ps1 -User vditest1 -WhatIf
+
+# Live: every user whose profile hasn't been touched in 60 days.
+.\FSLogixResetProfile.ps1 -LastUsedDays 60
+
+# Multi-root: scan both providers as independent shares.
+.\FSLogixResetProfile.ps1 -ProfileRoots '\\fs1\Profiles','\\fs2\Profiles' -User vdi* -WhatIf
+
+# Live: Office containers only for vdi* users, opt out of in-use check.
+.\FSLogixResetProfile.ps1 -User 'vdi*' -Scope Office -CheckInUse:$false
+
+# List targets only (no reset), for double-checking.
+.\FSLogixResetProfile.ps1 -User vdi* -LastUsedDays 60 -ListOnly
+```
+
+### Breaking changes vs the v1 CLI
+
+- The custom `-WhatIf` switch is gone; use the standard one.
+- `-OnlyOdfc` and `-OnlyProfile` are gone; use `-Scope Office` /
+  `-Scope Profile`.
+- A bare call with no filter now exits with an error.
 
 ---
 
 ## Known Assumptions / Limitations
 
-- Username detection is tailored to folder names of the form `username_S-1-5-21-...`. Adjust `Get-FSLogixProfiles` for different naming schemes.
-- The tool assumes all relevant FSLogix containers are `.vhd` or `.vhdx`.
-- Open-handle detection may have false negatives on network shares.
-
----
-
-## FSLogix Reset Profile CLI (Add-on)
-
-A command-line companion tool (`FSLogixResetProfile.ps1`) for resetting FSLogix profiles without the GUI. Uses the same scanning, filtering, and rename logic as the GUI tool.
-
-### Supports
-
-- `-User` filter (wildcards allowed, multi-value).
-- `-LastUsedDays` filter (by last write time).
-- `-OnlyOdfc` (Office-only).
-- `-OnlyProfile` (Profile-only).
-- `-WhatIf` (simulate; no changes, just logs the plan).
-- `-ListOnly` (show targets and exit, no rename).
-- `-ProfileRoot` to override the default UNC path.
-
-### Usage Examples
-
-```powershell
-# Dry run: show what would be reset for one user (profile only)
-.\FSLogixResetProfile.ps1 -User vditest1 -OnlyProfile -WhatIf
-
-# Dry run: all users older than 30 days, all containers
-.\FSLogixResetProfile.ps1 -LastUsedDays 30 -WhatIf
-
-# Actually reset ODFC only for all vdi* users
-.\FSLogixResetProfile.ps1 -User vdi* -OnlyOdfc
-
-# List targets only (no reset), for double-checking
-.\FSLogixResetProfile.ps1 -User vdi* -LastUsedDays 60 -ListOnly
-
-# Reset only the profile VHDX for the user bob (WhatIf first)
-.\FSLogixResetProfile.ps1 -User bob -OnlyProfile -WhatIf
-
-# Reset only users who haven't logged in 30 days and only their Office container
-.\FSLogixResetProfile.ps1 -LastUsedDays 30 -OnlyOdfc
-```
-
-### Notes
-
-- Always start with `-WhatIf` or `-ListOnly` to validate which containers will be affected.
-- The script does **not delete** any files; it only renames them with `-old` before the extension.
-- You can run this from any admin workstation or server that has access to the FSLogix share.
+- Username detection works for folder names of the forms
+  `username_SID` and `SID_username`, plus the
+  `NoProfileContainingFolder` layout. Adjust the regexes in
+  `FSLogixProfileCore.psm1` for other naming schemes.
+- The tool assumes relevant FSLogix containers are `.vhd` or `.vhdx`.
+- Open-handle detection can have false negatives on network shares.
+- AD queries can fail on a host that is not domain-joined; orphan
+  detection is then disabled (rows render as `UNKNOWN`).
 
 ---
 
 ## Version
 
-- **FSLogix Profile Manager (Horizon IC) – v0.7.0**
+- **FSLogix Profile Manager (Horizon IC) – v0.8.0**
 
-See `CHANGELOG.txt` for full version history.
+See `CHANGELOG.md` for the full history. The audit backlog lives in
+`BACKLOG.md`.
