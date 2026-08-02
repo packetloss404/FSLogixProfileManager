@@ -106,6 +106,27 @@ Check 'wi.untouched' (Test-Path -LiteralPath (Join-Path $dave 'Profile_dave.vhdx
 Check 'wi.logpath'   ([bool]$result.LogPath) 'True'
 Remove-Item $root2 -Recurse -Force
 
+Write-Host "-- move to retired --"
+# The Phase 4d feature: the retired file lands under <root>\_retired\<user>\<stamp>\
+# instead of in the user's writable directory. The original path is empty
+# after a live run, and the file at the new path has the expected name.
+$root3 = Join-Path $env:TEMP ('fsl_' + (Get-Random))
+$frank = Join-Path $root3 'S-1-5-21-9-9-9-3_frank'
+New-Item -ItemType Directory -Path $frank -Force | Out-Null
+Mk (Join-Path $frank 'Profile_frank.vhdx') 2048
+$profiles = @(Get-FSLogixProfiles -ProfileRoots @($root3))
+$frankRow = $profiles | Where-Object { $_.UserName -eq 'frank' }
+$result   = Rename-FSLogixProfileObject -ProfileObject $frankRow -Scope 'All' -MoveToRetired -Confirm:$false
+Check 'mv.renamed'  $result.Renamed     1
+# The original location is empty - the file left the user's directory.
+Check 'mv.sourcegone' (Test-Path -LiteralPath (Join-Path $frank 'Profile_frank.vhdx')) 'False'
+# The file is now under _retired\frank\<batch>\.
+$retiredDir = Join-Path (Join-Path (Join-Path $root3 '_retired') 'frank') $result.BatchStamp
+Check 'mv.retireddir' (Test-Path -LiteralPath $retiredDir) 'True'
+$moved = Get-ChildItem -LiteralPath $retiredDir -Filter 'Profile_frank-old-*.vhdx' -File
+Check 'mv.movedone'   ([bool]$moved) 'True'
+Remove-Item $root3 -Recurse -Force
+
 Remove-Item $root,$solo -Recurse -Force
 Write-Host ""
 if($fail){Write-Host "$fail CHECK(S) FAILED" -ForegroundColor Red; exit 1}else{Write-Host "ALL CHECKS PASSED" -ForegroundColor Green}

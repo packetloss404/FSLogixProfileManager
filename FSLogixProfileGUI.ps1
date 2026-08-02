@@ -695,7 +695,8 @@ function Show-RenamePreviewDialog {
         $SelectedProfiles,
         [ValidateSet('All', 'Office', 'Profile')][string]$Scope = 'All',
         [bool]$WhatIf,
-        [bool]$CheckInUse
+        [bool]$CheckInUse,
+        [bool]$MoveToRetired
     )
 
     $previewForm = New-Object System.Windows.Forms.Form
@@ -726,8 +727,9 @@ function Show-RenamePreviewDialog {
 
     # --- Subtitle: operator / users / horizon ---
     $horizonStatus = if (Test-FSLogixHorizonConnected) { "connected" } else { "not configured" }
+    $moveStatus = if ($MoveToRetired) { "moved to _retired" } else { "renamed in place" }
     $subtitle = New-Object System.Windows.Forms.Label
-    $subtitle.Text = "Operator: $env:USERDOMAIN\$env:USERNAME  |  Users: $($SelectedProfiles.Count)  |  Scope: $Scope  |  CheckInUse: $(if ($CheckInUse) {'on'} else {'off'})  |  Horizon: $horizonStatus"
+    $subtitle.Text = "Operator: $env:USERDOMAIN\$env:USERNAME  |  Users: $($SelectedProfiles.Count)  |  Scope: $Scope  |  CheckInUse: $(if ($CheckInUse) {'on'} else {'off'})  |  Mode: $moveStatus  |  Horizon: $horizonStatus"
     $subtitle.Dock = "Top"
     $subtitle.Height = 22
     $subtitle.TextAlign = "MiddleLeft"
@@ -753,7 +755,7 @@ function Show-RenamePreviewDialog {
     $inUseCount = 0
     $notReadyCount = 0
     foreach ($profile in $SelectedProfiles) {
-        $plan = @(Get-FSLogixRetirePlan -ProfileObject $profile -Scope $Scope -CheckInUse:$CheckInUse)
+        $plan = @(Get-FSLogixRetirePlan -ProfileObject $profile -Scope $Scope -CheckInUse:$CheckInUse -MoveToRetired:$MoveToRetired)
         foreach ($item in $plan) {
             $listItem = New-Object System.Windows.Forms.ListViewItem($item.UserName)
             [void]$listItem.SubItems.Add($item.Class)
@@ -1312,6 +1314,17 @@ $chkPreview.Checked = $true
 $chkPreview.Anchor = "Bottom,Left"
 $form.Controls.Add($chkPreview)
 
+# Default on: move retired containers out of the user's directory into
+# <root>\_retired\<user>\<stamp>\. Uncheck to fall back to the legacy
+# in-place rename.
+$chkMoveRetired = New-Object System.Windows.Forms.CheckBox
+$chkMoveRetired.Text = "Move to retired"
+$chkMoveRetired.Location = New-Object System.Drawing.Point(710, 715)
+$chkMoveRetired.AutoSize = $true
+$chkMoveRetired.Checked = $true
+$chkMoveRetired.Anchor = "Bottom,Left"
+$form.Controls.Add($chkMoveRetired)
+
 $btnDelete = New-Object System.Windows.Forms.Button
 $btnDelete.Text = "Reset Profile"
 $btnDelete.Location = New-Object System.Drawing.Point(950, 710)
@@ -1798,13 +1811,13 @@ $btnDelete.Add_Click({
     # Build the plan up front so the same numbers appear in preview and confirmation.
     $planTotal = 0
     foreach ($p in $selectedProfiles) {
-        $plan = @(Get-FSLogixRetirePlan -ProfileObject $p -Scope $scope -CheckInUse:$checkInUse)
+        $plan = @(Get-FSLogixRetirePlan -ProfileObject $p -Scope $scope -CheckInUse:$checkInUse -MoveToRetired:$chkMoveRetired.Checked)
         $planTotal += $plan.Count
     }
 
     # 1. Preview dialog (optional)
     if ($showPreview) {
-        $previewResult = Show-RenamePreviewDialog -SelectedProfiles $selectedProfiles -Scope $scope -WhatIf $whatIf -CheckInUse $checkInUse
+        $previewResult = Show-RenamePreviewDialog -SelectedProfiles $selectedProfiles -Scope $scope -WhatIf $whatIf -CheckInUse $checkInUse -MoveToRetired $chkMoveRetired.Checked
         if ($previewResult -ne [System.Windows.Forms.DialogResult]::OK) {
             Add-LogMessage "Rename cancelled from preview dialog" "INFO"
             return
@@ -1825,7 +1838,7 @@ $btnDelete.Add_Click({
     $results = @()
     try {
         foreach ($obj in $selectedProfiles) {
-            $r = Rename-FSLogixProfileObject -ProfileObject $obj -Scope $scope -CheckInUse:$checkInUse -Reason $reason -Confirm:$false
+            $r = Rename-FSLogixProfileObject -ProfileObject $obj -Scope $scope -CheckInUse:$checkInUse -Reason $reason -MoveToRetired:$chkMoveRetired.Checked -Confirm:$false
             $results += $r
         }
     } finally {

@@ -1196,7 +1196,8 @@ function Get-FSLogixRetirePlan {
         [Parameter(Mandatory = $true)]$ProfileObject,
         [ValidateSet('All', 'Office', 'Profile')][string]$Scope = 'All',
         [string]$BatchStamp,
-        [switch]$CheckInUse
+        [switch]$CheckInUse,
+        [switch]$MoveToRetired
     )
 
     if (-not $BatchStamp) { $BatchStamp = New-FSLogixBatchStamp }
@@ -1212,10 +1213,20 @@ function Get-FSLogixRetirePlan {
         $handles = Get-FSLogixOpenHandle -Path @($targets.Path)
     }
 
+    $safeUser = ($ProfileObject.UserName -replace ('[' + [regex]::Escape(-join [System.IO.Path]::GetInvalidFileNameChars()) + ']'), '_')
+
     $plan = @()
     foreach ($container in $targets) {
         $newName = Get-FSLogixRetireTargetName -FileName $container.Name -BatchStamp $BatchStamp
-        $newPath = Join-Path $container.Directory $newName
+        if ($MoveToRetired) {
+            # Lift the retired file out of the user's writable directory into
+            # <root>\_retired\<user>\<batch-stamp>\ so it stops counting against
+            # the user's FSRM quota and falls outside the user's ACL scope.
+            $newDir  = Join-Path (Join-Path (Join-Path $container.Root '_retired') $safeUser) $BatchStamp
+            $newPath = Join-Path $newDir $newName
+        } else {
+            $newPath = Join-Path $container.Directory $newName
+        }
 
         $state  = 'Ready'
         $holder = $null
@@ -1280,7 +1291,8 @@ function Rename-FSLogixProfileObject {
         [string]$BatchStamp,
         [switch]$AllOrNothing,
         [switch]$Force,
-        [switch]$RequireHorizonCheck
+        [switch]$RequireHorizonCheck,
+        [switch]$MoveToRetired
     )
 
     if (-not $BatchStamp) { $BatchStamp = New-FSLogixBatchStamp }
@@ -1353,7 +1365,7 @@ function Rename-FSLogixProfileObject {
             }
         }
 
-        $plan = @(Get-FSLogixRetirePlan -ProfileObject $ProfileObject -Scope $Scope -BatchStamp $BatchStamp -CheckInUse:$CheckInUse)
+        $plan = @(Get-FSLogixRetirePlan -ProfileObject $ProfileObject -Scope $Scope -BatchStamp $BatchStamp -CheckInUse:$CheckInUse -MoveToRetired:$MoveToRetired)
         $result.Planned = $plan.Count
 
         if ($plan.Count -eq 0) {
@@ -1390,11 +1402,23 @@ function Rename-FSLogixProfileObject {
             }
 
             try {
-                Rename-Item -LiteralPath $item.SourcePath -NewName $item.DestName -ErrorAction Stop
+                if ($MoveToRetired) {
+                    # Move across directories - the dest lives under
+                    # <root>\_retired\<user>\<batch-stamp>\. Create the
+                    # directory first; the share is expected to ACL it
+                    # operators-only.
+                    $destDir = Split-Path -Parent $item.DestPath
+                    if (-not (Test-Path -LiteralPath $destDir)) {
+                        [void](New-Item -Path $destDir -ItemType Directory -Force -ErrorAction Stop)
+                    }
+                    Move-Item -LiteralPath $item.SourcePath -Destination $item.DestPath -Force -ErrorAction Stop
+                } else {
+                    Rename-Item -LiteralPath $item.SourcePath -NewName $item.DestName -ErrorAction Stop
+                }
                 $result.Renamed++
                 $completed += $item
                 $result.Actions += $item
-                & $log ("Renamed {0} -> {1}" -f $item.SourcePath, $item.DestPath)
+                & $log (if ($MoveToRetired) { "Moved {0} -> {1}" } else { "Renamed {0} -> {1}" } -f $item.SourcePath, $item.DestPath) 'INFO'
                 Write-FSLogixAudit -Critical -Record @{
                     Action = 'RETIRE'; Mode = $mode; Reason = $Reason
                     TargetUser = $user; TargetSid = $sid
@@ -1416,7 +1440,11 @@ function Rename-FSLogixProfileObject {
                     & $log "All-or-nothing: rolling back $($completed.Count) rename(s) for '$user'." 'ERROR'
                     foreach ($done in ($completed | Sort-Object -Property SourcePath -Descending)) {
                         try {
-                            Rename-Item -LiteralPath $done.DestPath -NewName (Split-Path -Leaf $done.SourcePath) -ErrorAction Stop
+                            if ($MoveToRetired) {
+                                Move-Item -LiteralPath $done.DestPath -Destination $done.SourcePath -Force -ErrorAction Stop
+                            } else {
+                                Rename-Item -LiteralPath $done.DestPath -NewName (Split-Path -Leaf $done.SourcePath) -ErrorAction Stop
+                            }
                             & $log "Rolled back $($done.DestPath) -> $($done.SourcePath)" 'WARN'
                             Write-FSLogixAudit -Record @{
                                 Action = 'RETIRE-ROLLBACK'; Mode = $mode; Reason = $Reason
