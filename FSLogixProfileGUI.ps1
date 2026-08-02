@@ -500,6 +500,196 @@ function Show-SettingsDialog {
     $script:AuditRootIsExplicit = $true
     Add-LogMessage "Audit root set to: $($txtRoot.Text)" "INFO"
 }
+
+# --------------------------------------------------------------------
+#  Retired-containers dialog
+# --------------------------------------------------------------------
+# Lists retired containers and offers batch Restore and Purge.
+# Both flows share the same safety semantics as the live retire path:
+#   - the audit log records every action with reason and actor
+#   - purge has a retention floor and refuses a last copy without an
+#     explicit -AllowLastCopy
+#   - restore refuses if the displaced live container is currently
+#     mounted
+function Show-RetiredDialog {
+    param([string[]]$Roots)
+
+    $dlg = New-Object System.Windows.Forms.Form
+    $dlg.Text = "Retired Containers"
+    $dlg.Size = New-Object System.Drawing.Size(960, 580)
+    $dlg.StartPosition = "CenterParent"
+    $dlg.FormBorderStyle = "Sizable"
+    $dlg.MinimumSize = New-Object System.Drawing.Size(720, 400)
+
+    $lblInfo = New-Object System.Windows.Forms.Label
+    $lblInfo.Text = "Roots: $($Roots -join '; ')  |  Older than:"
+    $lblInfo.Location = New-Object System.Drawing.Point(12, 12)
+    $lblInfo.AutoSize = $true
+    $dlg.Controls.Add($lblInfo)
+
+    $numAge = New-Object System.Windows.Forms.NumericUpDown
+    $numAge.Location = New-Object System.Drawing.Point(280, 9)
+    $numAge.Minimum = 0
+    $numAge.Maximum = 3650
+    $numAge.Value = 0
+    $numAge.Size = New-Object System.Drawing.Size(60, 22)
+    $dlg.Controls.Add($numAge)
+
+    $lblDays = New-Object System.Windows.Forms.Label
+    $lblDays.Text = "days (0 = all)"
+    $lblDays.Location = New-Object System.Drawing.Point(345, 12)
+    $lblDays.AutoSize = $true
+    $dlg.Controls.Add($lblDays)
+
+    $btnRefresh = New-Object System.Windows.Forms.Button
+    $btnRefresh.Text = "Refresh"
+    $btnRefresh.Location = New-Object System.Drawing.Point(440, 8)
+    $btnRefresh.Size = New-Object System.Drawing.Size(80, 26)
+    $dlg.Controls.Add($btnRefresh)
+
+    $gridRet = New-Object System.Windows.Forms.DataGridView
+    $gridRet.Location = New-Object System.Drawing.Point(12, 40)
+    $gridRet.Size = New-Object System.Drawing.Size(920, 420)
+    $gridRet.AllowUserToAddRows = $false
+    $gridRet.AllowUserToDeleteRows = $false
+    $gridRet.ReadOnly = $true
+    $gridRet.MultiSelect = $true
+    $gridRet.SelectionMode = "FullRowSelect"
+    $gridRet.AutoGenerateColumns = $false
+    $dlg.Controls.Add($gridRet)
+
+    [void]$gridRet.Columns.Add("User",         120)
+    [void]$gridRet.Columns.Add("Class",         60)
+    [void]$gridRet.Columns.Add("Size (GB)",     70)
+    [void]$gridRet.Columns.Add("Retired On",   150)
+    [void]$gridRet.Columns.Add("Age (d)",       60)
+    [void]$gridRet.Columns.Add("Last Copy",     75)
+    [void]$gridRet.Columns.Add("Source",        90)
+    [void]$gridRet.Columns.Add("Name",         200)
+    [void]$gridRet.Columns.Add("Directory",    280)
+
+    $btnPurge = New-Object System.Windows.Forms.Button
+    $btnPurge.Text = "Purge..."
+    $btnPurge.Location = New-Object System.Drawing.Point(12, 475)
+    $btnPurge.Size = New-Object System.Drawing.Size(100, 32)
+    $dlg.Controls.Add($btnPurge)
+
+    $btnRestore = New-Object System.Windows.Forms.Button
+    $btnRestore.Text = "Restore..."
+    $btnRestore.Location = New-Object System.Drawing.Point(120, 475)
+    $btnRestore.Size = New-Object System.Drawing.Size(100, 32)
+    $dlg.Controls.Add($btnRestore)
+
+    $btnClose = New-Object System.Windows.Forms.Button
+    $btnClose.Text = "Close"
+    $btnClose.Location = New-Object System.Drawing.Point(840, 475)
+    $btnClose.Size = New-Object System.Drawing.Size(90, 32)
+    $btnClose.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+    $dlg.Controls.Add($btnClose)
+
+    $dlg.CancelButton = $btnClose
+
+    function Refresh-RetiredList {
+        $gridRet.Rows.Clear()
+        $items = @(Get-FSLogixRetiredContainer -ProfileRoots $Roots -OlderThanDays ([int]$numAge.Value))
+        foreach ($item in $items) {
+            $idx = $gridRet.Rows.Add()
+            $r = $gridRet.Rows[$idx]
+            $r.Cells[0].Value = $item.UserName
+            $r.Cells[1].Value = $item.Class
+            $r.Cells[2].Value = [Math]::Round($item.SizeGB, 2)
+            $r.Cells[3].Value = if ($item.RetiredOn) { $item.RetiredOn.ToString("yyyy-MM-dd HH:mm") } else { '' }
+            $r.Cells[4].Value = $item.AgeDays
+            $r.Cells[5].Value = if ($item.HasLiveSibling) { 'No' } else { 'YES' }
+            $r.Cells[6].Value = $item.DateSource
+            $r.Cells[7].Value = $item.Name
+            $r.Cells[8].Value = $item.Directory
+            $r.Tag = $item
+            if (-not $item.HasLiveSibling) { $r.DefaultCellStyle.BackColor = [System.Drawing.Color]::MistyRose }
+        }
+        Add-LogMessage "Retired dialog: $($items.Count) container(s) listed." "INFO"
+    }
+
+    $btnRefresh.Add_Click({ Refresh-RetiredList })
+    $numAge.Add_ValueChanged({ Refresh-RetiredList })
+    Refresh-RetiredList
+
+    $btnRestore.Add_Click({
+        $selected = @()
+        foreach ($r in $gridRet.SelectedRows) { if ($r.Tag) { $selected += $r.Tag } }
+        if ($selected.Count -eq 0) {
+            [System.Windows.Forms.MessageBox]::Show("Select one or more retired containers to restore.")
+            return
+        }
+        $reason = $txtReason.Text.Trim()
+        if ([string]::IsNullOrWhiteSpace($reason)) {
+            [System.Windows.Forms.MessageBox]::Show("A reason / ticket is required for restores. Set one in the main window.")
+            return
+        }
+        $confirm = [System.Windows.Forms.MessageBox]::Show(
+            "Restore $($selected.Count) retired container(s) back to their live name?`n`nThis reverses a retire - the live container (if any) will be displaced to *-superseded-<stamp>.",
+            "Confirm Restore", [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Warning, [System.Windows.Forms.DialogResult]::No)
+        if ($confirm -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+
+        $totalRestored = 0; $totalDisplaced = 0; $totalFailed = 0
+        foreach ($item in $selected) {
+            $r = Restore-FSLogixProfileBatch -Container @($item) -Reason $reason -Confirm:$false
+            $totalRestored  += $r.Restored
+            $totalDisplaced += $r.Displaced
+            $totalFailed    += $r.Failed
+        }
+        Add-LogMessage "Restore: $totalRestored restored, $totalDisplaced displaced, $totalFailed failed (of $($selected.Count) selected)" "INFO"
+        [System.Windows.Forms.MessageBox]::Show("Restored: $totalRestored`nDisplaced: $totalDisplaced`nFailed: $totalFailed")
+        Refresh-RetiredList
+    })
+
+    $btnPurge.Add_Click({
+        $selected = @()
+        foreach ($r in $gridRet.SelectedRows) { if ($r.Tag) { $selected += $r.Tag } }
+        if ($selected.Count -eq 0) {
+            [System.Windows.Forms.MessageBox]::Show("Select one or more retired containers to purge.")
+            return
+        }
+        $hasLastCopy = @($selected | Where-Object { -not $_.HasLiveSibling })
+        $hasUndated  = @($selected | Where-Object { $_.DateSource -ne 'stamp' })
+        $reason = $txtReason.Text.Trim()
+        if ([string]::IsNullOrWhiteSpace($reason)) {
+            [System.Windows.Forms.MessageBox]::Show("A reason / ticket is required for purges. Set one in the main window.")
+            return
+        }
+        $msg = "Purge $($selected.Count) retired container(s)?`n`n"
+        if ($hasLastCopy.Count -gt 0) {
+            $msg += "WARNING: $($hasLastCopy.Count) of these are the user's ONLY copy (no live sibling). Will add -AllowLastCopy to proceed with those.`n`n"
+        }
+        if ($hasUndated.Count -gt 0) {
+            $msg += "NOTE: $($hasUndated.Count) have an unknown retirement date (legacy '-old' suffix). Will add -IncludeUndated to proceed with those.`n`n"
+        }
+        $msg += "Retention floor: 90 days. Anything younger is refused."
+
+        $confirm = [System.Windows.Forms.MessageBox]::Show($msg, "Confirm Purge", [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Warning, [System.Windows.Forms.DialogResult]::No)
+        if ($confirm -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+
+        $purgeArgs = @{
+            Container          = $selected
+            RetentionFloorDays = 90
+            Reason             = $reason
+            Confirm            = $false
+        }
+        if ($hasLastCopy.Count -gt 0) { $purgeArgs.AllowLastCopy = $true }
+        if ($hasUndated.Count -gt 0)  { $purgeArgs.IncludeUndated = $true }
+        $purgeResult = Remove-FSLogixRetiredContainer @purgeArgs
+        Add-LogMessage "Purge: $($purgeResult.Removed) removed, $($purgeResult.SkippedLastCopy) last-copy skipped, $($purgeResult.SkippedUndated) undated skipped, $($purgeResult.SkippedTooNew) too-new skipped, $($purgeResult.Failed) failed" "INFO"
+        [System.Windows.Forms.MessageBox]::Show("Removed: $($purgeResult.Removed)`nLast-copy skipped: $($purgeResult.SkippedLastCopy)`nUndated skipped: $($purgeResult.SkippedUndated)`nToo-new skipped: $($purgeResult.SkippedTooNew)`nFailed: $($purgeResult.Failed)`nReclaimed: $([Math]::Round($purgeResult.ReclaimedGB, 2)) GB")
+        Refresh-RetiredList
+    })
+
+    $dlg.ShowDialog() | Out-Null
+    $dlg.Dispose()
+}
+
+# --------------------------------------------------------------------
+#  Rename Preview Dialog
+# --------------------------------------------------------------------
 function Show-RenamePreviewDialog {
     param(
         $SelectedProfiles,
@@ -806,8 +996,8 @@ try {
 }
 
 $btnGithub = New-Object System.Windows.Forms.Button
-$btnGithub.Location = New-Object System.Drawing.Point(1158, 10)
-$btnGithub.Size     = New-Object System.Drawing.Size(28, 28)
+$btnGithub.Location = New-Object System.Drawing.Point(1165, 10)
+$btnGithub.Size     = New-Object System.Drawing.Size(25, 28)
 $btnGithub.FlatStyle = 'Flat'
 $btnGithub.FlatAppearance.BorderSize = 0
 $btnGithub.BackColor = $form.BackColor
@@ -829,14 +1019,21 @@ $form.Controls.Add($btnGithub)
 $btnHorizon = New-Object System.Windows.Forms.Button
 $btnHorizon.Text = "Horizon..."
 $btnHorizon.Location = New-Object System.Drawing.Point(985, 10)
-$btnHorizon.Size = New-Object System.Drawing.Size(80, 28)
+$btnHorizon.Size = New-Object System.Drawing.Size(60, 28)
 $form.Controls.Add($btnHorizon)
+
+# Retired-containers dialog button
+$btnRetired = New-Object System.Windows.Forms.Button
+$btnRetired.Text = "Retired..."
+$btnRetired.Location = New-Object System.Drawing.Point(1050, 10)
+$btnRetired.Size = New-Object System.Drawing.Size(60, 28)
+$form.Controls.Add($btnRetired)
 
 # Settings button (audit root, etc.)
 $btnSettings = New-Object System.Windows.Forms.Button
-$btnSettings.Text = "Settings..."
-$btnSettings.Location = New-Object System.Drawing.Point(1070, 10)
-$btnSettings.Size = New-Object System.Drawing.Size(80, 28)
+$btnSettings.Text = "Set..."
+$btnSettings.Location = New-Object System.Drawing.Point(1115, 10)
+$btnSettings.Size = New-Object System.Drawing.Size(45, 28)
 $form.Controls.Add($btnSettings)
 
 # --- Row 2: Filter / Age / WhatIf / Highlight ---
@@ -1693,6 +1890,11 @@ $btnClose.Add_Click({ $form.Close() })
 
 $btnHorizon.Add_Click({ Show-HorizonConnectDialog })
 $btnSettings.Add_Click({ Show-SettingsDialog })
+$btnRetired.Add_Click({
+    $roots = $txtRoot.Text -split ';' | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+    if ($roots.Count -eq 0) { [System.Windows.Forms.MessageBox]::Show("No profile roots specified."); return }
+    Show-RetiredDialog -Roots $roots
+})
 
 # --------------------------------------------------------------------
 #  Apply initial theme and start
