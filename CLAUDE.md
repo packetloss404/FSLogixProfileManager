@@ -1,227 +1,277 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Guidance for AI coding agents working in this repository.
 
 ## Project Overview
 
-**FSLogix Profile Manager (Horizon IC)** is a WinForms-based PowerShell GUI tool for managing FSLogix user profile containers in VMware Horizon Instant Clones environments. It provides a safe way to retire/reset user profiles by renaming containers rather than deleting them.
+**FSLogix Profile Manager (Horizon IC)** is a WinForms PowerShell GUI and a
+matching CLI for managing FSLogix user profile containers in VMware Horizon
+Instant Clones environments. It retires (renames) containers rather than
+deleting them, so a bad reset is reversible from the Retired dialog.
 
-### Environment Assumptions
+### Environment
 
-- FSLogix containers stored under UNC paths (supports multiple semicolon-separated paths for Cloud Cache)
-- Default: `\\fml-fslogix\FSLogixUserProfiles`
-- Folder naming pattern: `username_S-1-5-21-XXXXXXXXX-XXXXXXXXX-XXXXXXXXX-XXXXX`
-- Container files: `*.vhd` and `*.vhdx` files
+- FSLogix containers stored under UNC paths (multiple semicolon-separated
+  for Cloud Cache).
+- Default: `\\fml-fslogix\FSLogixUserProfiles`.
+- Folder naming: `username_S-1-5-21-...` (both FlipFlop orders supported,
+  plus `NoProfileContainingFolder`).
+- Container files: `*.vhd` and `*.vhdx`.
 
 ## Running and Testing
 
-### Launch the Application
+### Launch the GUI
 
 ```powershell
 powershell.exe -STA -ExecutionPolicy Bypass -File .\FSLogixProfileGUI.ps1
 ```
 
-**Important:** The `-STA` (Single-Threaded Apartment) flag is **required** for WinForms to function properly.
+The `-STA` (Single-Threaded Apartment) flag is required for WinForms.
 
-### Testing with WhatIf Mode
+### Launch the CLI
 
-The tool defaults to WhatIf mode (simulate) which is **enabled by default**. This logs what would happen without making actual changes. Always test with WhatIf first.
+```powershell
+powershell.exe -ExecutionPolicy Bypass -File .\FSLogixResetProfile.ps1 -User vditest1 -WhatIf
+```
 
-Log files are written to:
-- `%TEMP%` with pattern: `FSLogix_Rename_username_YYYYMMDDHHMMSS.log`
-- Embedded log panel in the UI (real-time)
+### Run the tests
+
+```powershell
+# Module: 39 checks (pure logic + a synthetic share)
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\Test-FSLogixProfileCore.ps1
+
+# CLI: 13 smoke tests (safety contract: bare-call refusal, WhatIf, etc.)
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\Test-FSLogixResetProfile.ps1
+```
+
+A bare call (no `-User`, no `-LastUsedDays`, no `-All`) is **refused**. The
+default mode is `WhatIf`. Both behaviours are part of the safety contract
+the CLI tests pin down.
+
+### WhatIf mode
+
+The tool defaults to WhatIf (simulate) in the GUI. The CLI uses standard
+`SupportsShouldProcess`, so `-WhatIf` and `-Confirm` work the way every
+other PowerShell advanced function does.
+
+Log files go to `%TEMP%` with pattern
+`FSLogix_Rename_<user>_<WHATIF|LIVE>_<stamp>.log`, plus the GUI's
+embedded log panel in real time.
 
 ## Architecture
 
-### Core Functions
+```
+FSLogixProfileCore.psm1   - the only place scan/filter/retire/restore
+                            /purge/Audit/Horizon/AD logic lives.
+                            WinForms-free. Importable from a runspace.
 
-1. **`Get-FSLogixProfiles`** (lines 132-238)
-   - Accepts array of profile roots (supports multi-root/Cloud Cache)
-   - Recursively scans each root for `*.vhd/*.vhdx` files
-   - Extracts usernames AND SIDs from folder names using regex: `^(?<user>.+?)_(?<sid>S-1-5-21-[\d-]+)`
-   - Aggregates multiple containers per user across all roots
-   - Returns custom objects with: UserName, ContainerCount, ProfileSizeGB, OfficeSizeGB, TotalSizeGB, LastWriteTime, RootFolder, ContainerFiles array, SIDs (HashSet), ProfileRoots (HashSet)
-   - Classification: Files matching `odfc|office` are Office containers, others are Profile containers
+FSLogixProfileGUI.ps1     - WinForms host. Imports the module. A thin
+                            shell over it. -STA required to run.
 
-2. **`Rename-FSLogixProfileObject`** (lines 243-338)
-   - Core rename/retire operation with per-user logging
-   - Supports modes via switches: `-OnlyOdfc`, `-OnlyProfile`, `-CheckInUse`
-   - Open-handle detection: skips in-use files when `-CheckInUse` is true
-   - Renames containers by appending `-old` before extension
-   - WhatIf support: logs `WHATIF: Would rename...` without actual changes
-   - Logs to both file and embedded UI log panel
-   - Returns log file path
+FSLogixResetProfile.ps1   - CLI host. Imports the module. A thin
+                            shell over it. -STA not required.
 
-3. **`Apply-Filters`** (lines 343-367)
-   - Filters profile list by username substring match
-   - Optional age filter: LastWriteTime < (Now - AgeDays)
-   - Returns filtered array
-
-4. **`Update-RowHighlight`** (lines 372-400)
-   - Highlights DataGridView rows where TotalSizeGB >= threshold
-   - Theme-aware: uses MistyRose for light theme, dark red for dark theme
-
-5. **`Export-GridToCSV`** (lines 405-433)
-   - Exports current grid contents to CSV file
-   - Proper escaping for CSV format
-
-6. **`Show-RenamePreviewDialog`** (lines 438-544)
-   - Modal dialog showing all files to be renamed
-   - Columns: User, Current Path, New Path, Status
-   - Color-coded status: OK (white), IN USE (red), EXISTS/MISSING (yellow)
-   - Returns DialogResult (OK to proceed, Cancel to abort)
-
-7. **`Apply-Theme`** (lines 549-629)
-   - Applies Light or Dark theme to all UI controls
-   - Recursively updates form, grid, buttons, text boxes, log panel
-   - Updates highlight colors per theme
-
-8. **`Test-FileInUse`** (lines 100-115)
-   - Attempts exclusive file open to detect if VHD/VHDX is mounted
-   - Returns $true if file is locked, $false if available
-
-9. **`Add-LogMessage`** (lines 72-95)
-   - Adds timestamped message to embedded log panel
-   - Supports log levels: INFO, WARN, ERROR
-   - Maintains rolling buffer of 500 messages
-
-### UI Structure
-
-The WinForms UI is built using `System.Windows.Forms` and `System.Drawing`:
-
-- **Row 1** (top): Profile Root textbox (multi-root hint below), Load/Rescan buttons, version label, Theme dropdown, GitHub button
-- **Row 2**: User filter, age filter controls, WhatIf checkbox, Skip in-use checkbox, highlight controls, Export CSV button
-- **SplitContainer** (main area):
-  - **Panel 1**: DataGridView with 8 columns (User, # Cont, Profile GB, Office GB, Total GB, Last Write, SIDs, Root Folder)
-  - **Panel 2**: Embedded log panel with Clear button
-- **Bottom row**: Status label, ODFC-only/Profile-only checkboxes, Preview checkbox, Reset Profile button, Close button
-
-### Key Design Patterns
-
-- **Manual DataGridView population**: Rows added explicitly, with profile objects stored in `Row.Tag` (not data-binding)
-- **Column sorting**: Click headers to sort; uses `ColumnHeaderMouseClick` event with programmatic sorting
-- **Mutual exclusivity**: ODFC-only and Profile-only checkboxes use CheckedChanged events
-- **Theme system**: Theme definitions in `$script:Themes` hashtable; `Apply-Theme` function recurses through controls
-- **Preview workflow**: `Show-RenamePreviewDialog` returns DialogResult before any rename operation
-- **Safety-first**: WhatIf ON by default, Skip in-use ON by default, Preview ON by default, rename instead of delete
-
-### Global Script Variables
-
-- `$script:AllProfiles`: Holds all loaded profile objects (before filtering)
-- `$script:DefaultRowBackColor`: Current theme's grid background color
-- `$script:CurrentHighlightColor`: Current theme's highlight color
-- `$script:Themes`: Hashtable of Light/Dark theme definitions
-- `$script:CurrentTheme`: "Light" or "Dark"
-- `$script:LogMessages`: ArrayList of log entries for embedded panel
-- `$script:txtLog`: Reference to log TextBox control
-- `$script:SortColumn`: Currently sorted column index (-1 if none)
-- `$script:SortAscending`: Sort direction boolean
-- `$appVersion`: Version string (0.6.0)
-
-## Common Development Tasks
-
-### Modifying Username Detection Logic
-
-Edit the regex patterns in `Get-FSLogixProfiles` (lines 163-175):
-- Primary pattern: `'^(?<user>.+?)_(?<sid>S-1-5-21-[\d-]+)'`
-- Captures both username and SID groups
-- Fallback checks both folder name and file basename
-
-### Adding New Grid Columns
-
-1. Use `Add-Col` helper function (line 851-857) to add column definition
-2. Update `Show-ProfilesInGrid` to populate the new column cells
-3. Update column sorting switch statement in `ColumnHeaderMouseClick` handler
-4. Update `Export-GridToCSV` if column needs special handling
-
-### Changing Container Classification
-
-ODFC/Office detection uses regex `'odfc|office'` (lines 217, 277, 282, 477-481). Modify this pattern to adjust classification logic.
-
-### Extending Rename Behavior
-
-The rename logic is in `Rename-FSLogixProfileObject`. Current pattern: `"{0}-old{1}" -f $base, $ext` (line 312). Modify to change naming scheme.
-
-### Adding New Themes
-
-Add new theme definition to `$script:Themes` hashtable (lines 31-63). Required properties:
-- FormBackColor, FormForeColor
-- GridBackColor, GridForeColor, GridHeaderBackColor, GridHeaderForeColor, GridAlternateRowColor
-- HighlightColor
-- ButtonBackColor, ButtonForeColor
-- TextBoxBackColor, TextBoxForeColor
-- LogPanelBackColor, LogPanelForeColor
-
-Then add the theme name to `$cmbTheme.Items` (lines 692-693).
-
-## Important Constraints and Behaviors
-
-- **No deletion**: Tool never deletes files, only renames them
-- **Open-handle detection**: Enabled by default; uses file lock test (may have false negatives for network shares)
-- **Multi-root support**: Semicolon-separated paths; results merged by username
-- **PowerShell 5.1+ required**: Uses .NET Framework WinForms assemblies
-- **Network access required**: Must have access to the FSLogix UNC share(s)
-- **STA mode required**: WinForms requires Single-Threaded Apartment mode
-
-## Version History
-
-- **v0.7.0**: Health monitoring - VHD health checks, disk space monitoring, orphan detection, status column, issues-only filter, color legend
-- **v0.6.0**: Major feature release - SID column, CSV export, column sorting, multi-root support, rename preview, open-handle detection, theming, embedded log panel, rescan button
-- **v0.5.2**: Profile-only/ODFC-only targeting, GitHub button
-- **v0.5.1**: Rename-based retire behavior (replaced delete)
-- **v0.5.0**: Initial FSLogix Horizon IC-focused build
-
----
-
-## FSLogix Reset Profile CLI (Add-on)
-
-A CLI-only companion tool (`FSLogixResetProfile.ps1`) extracted from the GUI utility. Provides the same profile discovery, filtering, and rename logic without requiring WinForms or STA mode.
-
-### Running the CLI
-
-```powershell
-# Always start with -WhatIf to preview changes
-.\FSLogixResetProfile.ps1 -User <username> -WhatIf
-
-# Or use -ListOnly to see targets without generating logs
-.\FSLogixResetProfile.ps1 -User <username> -ListOnly
-
-# Execute actual reset (removes -WhatIf)
-.\FSLogixResetProfile.ps1 -User <username>
+tests/                    - smoke tests. No AD / Hyper-V / Horizon
+                            / network share required.
 ```
 
-### CLI Architecture
+The module is the source of truth. The two entry points only do
+presentation. When you change retire behaviour, change the module.
 
-The script (`FSLogixResetProfile.ps1`) mirrors the GUI's core functions:
+### `FSLogixProfileCore.psm1` — exported functions
 
-1. **Profile Discovery (`Get-FSLogixProfiles`)**: Same recursive scan and user aggregation as the GUI. Parses `username_S-1-5-21-...` folder patterns, builds profile objects with container counts, sizes, and file paths.
+Grouped by responsibility.
 
-2. **Filtering (`Apply-Filters`)**: Applies `-User` (wildcard support, multi-value) and `-LastUsedDays` filters.
+**Logging and state**
 
-3. **Rename Operations (`Rename-FSLogixProfileObject`)**: Same rename-to-`-old` logic. Supports `-OnlyOdfc` and `-OnlyProfile` switches. Generates per-user logs in `%TEMP%`.
+- `Set-FSLogixLogHandler` / `Write-FSLogixLog` — routes module log output
+  to a host-supplied scriptblock. `PROGRESS`-level lines are meant for
+  a status bar; the rest go to a log buffer.
+- `Set-FSLogixAuditRoot` / `Get-FSLogixAuditRoot` / `Write-FSLogixAudit`
+  — monthly append-only CSV; `-Critical` aborts on failed write when a
+  central root was set explicitly.
 
-### CLI Parameters
+**Container naming**
 
-- `-ProfileRoot` – Override the default UNC path (`\\fml-fslogix\FSLogixUserProfiles`)
-- `-User` – Target specific users (supports wildcards and arrays)
-- `-LastUsedDays` – Filter to profiles not written to in N days
-- `-OnlyOdfc` – Reset only Office/ODFC containers
-- `-OnlyProfile` – Reset only Profile containers (excludes ODFC)
-- `-WhatIf` – Preview mode, no changes made
-- `-ListOnly` – Show targets and exit before rename
+- `Get-FSLogixContainerClass` — `Profile` / `Office` / `Unknown`
+  classification, by positive filename prefix.
+- `Test-FSLogixRetiredName` / `Test-FSLogixSupersededName` — detection.
+- `New-FSLogixBatchStamp` / `Get-FSLogixRetireTargetName` — produce the
+  timestamped `<name>-old-<stamp>.<ext>` form.
+- `Resolve-FSLogixIdentity` — SID-first / user-first / `NoProfileContainingFolder`
+  / Unresolved, with retirement-suffix stripped first.
 
-### CLI Safety Mechanisms
+**In-use detection**
 
-- Mutual exclusion: Cannot specify both `-OnlyOdfc` and `-OnlyProfile`
-- Skips rename if `*-old.vhd(x)` target already exists
-- Handles missing container files gracefully with logging
-- No deletion: All operations are rename-based
+- `Test-FSLogixFileInUse` — local lock probe (Read, FileShare.None).
+- `Get-FSLogixOpenHandle` — `Get-SmbOpenFile` via CimSession; names the
+  holder. Returns `$null` (not an empty list) when it could not be
+  queried, so "nobody has it open" is distinguishable from "I could
+  not find out".
+- `Get-FSLogixContainerState` — combined Free / InUse / AccessDenied /
+  Missing, preferring the SMB open-file list when available.
 
-### Testing CLI Changes
+**VHD inspection**
 
-1. Test with `-WhatIf` first to validate logic without making changes
-2. Use `-ListOnly` to verify filtering and discovery logic
-3. Test with a single user (`-User <testuser>`) before broader operations
-4. Verify log file generation in `%TEMP%` (pattern: `FSLogix_Rename_<username>_<timestamp>.log`)
-5. Test container type filtering with `-OnlyOdfc` and `-OnlyProfile`
-6. Test wildcard patterns (`-User vdi*`) and multi-value user filters
+- `Test-FSLogixVhdSignature` — VHD/VHDX footer signature check that works
+  without Hyper-V. `Valid` / `Invalid` / `Unknown`.
+- `Get-FSLogixVhdMaxSizeGB` — `Get-VHD`; returns `$null` when the cmdlet
+  is not available (deliberate, never guessed).
+- `Get-FSLogixSettings` — reads FSLogix policy from a session host's
+  registry (local or remote). Returns `$null` when nothing could be
+  read.
+- `Get-FSLogixContainerHealth` — `EMPTY` / `BAD_SIGNATURE` / `NEAR_LIMIT`
+  / `OVER_LIMIT` / `CORRUPT` flags.
+
+**Active Directory**
+
+- `Initialize-FSLogixADCheck` / `Clear-FSLogixADCache` /
+  `Get-FSLogixADStatus` — SID-first bind, `lastLogonTimestamp` (handles
+  the `IADsLargeInteger` shape), disabled state.
+- `Get-FSLogixLdapEscapedValue` — RFC 4515 escaping for filter values.
+
+**Horizon session gate**
+
+- `Connect-FSLogixHorizon` / `Disconnect-FSLogixHorizon` /
+  `Test-FSLogixHorizonConnected` / `Get-FSLogixHorizonSession` /
+  `Stop-FSLogixHorizonSession` — REST login, session lookup, logoff.
+  Endpoint versions move between Horizon 8 releases; check
+  `/rest/swagger.yaml` on the build if the inventory path 404s.
+
+**Discovery**
+
+- `Get-FSLogixProfiles` — scans one or more roots, classifies, resolves
+  identity, aggregates by user, returns one record per user with a
+  `Containers` array and a separate `RetiredContainers` array.
+  Always returns an array (use the leading-comma return idiom).
+- `Select-FSLogixProfile` — filter by user / age / AD last logon /
+  issues / orphans. Wildcard patterns are escaped before the implicit
+  `*...*` wrap, so a `[` in the filter box is safe.
+
+**Retire plan and execution**
+
+- `Get-FSLogixRetirePlan` — what would happen, with the in-use probe.
+  Both the preview dialog and the retire itself use this.
+- `Rename-FSLogixProfileObject` — rename (or, with `-MoveToRetired`,
+  move to `<root>\_retired\<user>\<batch-stamp>\`). Returns
+  Renamed / SkippedInUse / SkippedExists / Missing / Failed / Aborted.
+- `Restore-FSLogixProfileBatch` — reverses a retire. Displaces any
+  live sibling to `*-superseded-<stamp>` rather than overwriting.
+  Refuses if the displaced live container is currently mounted.
+
+**Retired-container lifecycle**
+
+- `Get-FSLogixRetiredContainer` — report with `DateSource` (`stamp` /
+  `mtime-approx`) and `HasLiveSibling`.
+- `Remove-FSLogixRetiredContainer` — gated purge. `-RetentionFloorDays`
+  is a hard floor; `-AllowLastCopy` is required to purge a last copy;
+  `-IncludeUndated` is required for legacy `-old` files.
+
+### `FSLogixProfileGUI.ps1` — layout
+
+The script does five things:
+
+1. Import the module and route its log handler to `Add-LogMessage`
+   (PROGRESS goes to `$lblStatus`; everything else goes to `$txtLog`).
+2. Build the theme dictionaries and the form (Dark / Light, with
+   `HealthCorrupt` / `HealthOrphan` / `HealthNearLimit` so health
+   colours re-theme properly).
+3. Build the controls: top row (profile root, Load, Rescan, Check AD,
+   version, theme, Horizon, Retired, Set, GitHub); filter row
+   (user, Apply, Older than, AD last logon, Issues only, WhatIf,
+   Skip in-use, Highlight >); reason row (txtReason, required for
+   live runs); split container (DataGridView 10 columns + log
+   panel); bottom row (status, Only ODFC, Only Profile, Preview,
+   Move to retired, Reset Profile, Close).
+4. Wire the buttons. The Reset button has `Set-ResetButtonAppearance`
+   for the red LIVE state; the scan button kicks off
+   `Start-BackgroundScan`, which runs the module in a runspace and
+   drains a `ConcurrentQueue` via a WinForms Timer on the UI thread.
+5. Define the dialog functions: `Show-ResetConfirmation` (proportionate,
+  typed count above threshold), `Show-RenamePreviewDialog` (LIVE banner,
+  plan, Cancel as default), `Show-HorizonConnectDialog`,
+  `Show-SettingsDialog`, `Show-RetiredDialog` (Restore + Purge).
+
+### `FSLogixResetProfile.ps1` — parameters
+
+- `-ProfileRoot` (default `\\fml-fslogix\FSLogixUserProfiles`) or
+  `-ProfileRoots` (parameter set, required, array).
+- `-User` (wildcards, multi-value), `-LastUsedDays`, `-All` (at least
+  one is required or the script refuses outright).
+- `-Scope` (`All` / `Office` / `Profile`).
+- `-CheckInUse` (default on), `-Force`, `-ListOnly`.
+- Standard `-WhatIf` / `-Confirm` from `[CmdletBinding(SupportsShouldProcess,
+  ConfirmImpact='High')]`.
+
+The script reads `Write-Output` for testable lines (summary, matched
+count, no-match message) and `Write-Host` for the colored header. The
+tests capture `StdOut`, so anything the tests check must be
+`Write-Output`.
+
+## Conventions
+
+- **No deletion in the module.** The only function that deletes is
+  `Remove-FSLogixRetiredContainer`, and it has a retention floor plus
+  a last-copy guard. Anything else uses `Rename-Item` or `Move-Item`.
+- **Never guess.** `MaxSizeGB` is `$null` when unknown. `OpenHandles`
+  returns `$null` when it could not be queried. Render "unknown",
+  not "fine".
+- **Collection returns use the leading-comma idiom.** `return , @($x)`.
+  This prevents the scalar-unroll bug on a one-element array. **Callers
+  must use a direct call (`$r = func`), not `@(func)`.** `@(func)` gives
+  a 1-element wrapper, not the real result. The existing tests use
+  method-style access (`(func).Count`), which unrolls the wrapper; the
+  CLI and GUI use direct call.
+- **No WinForms in the module.** The module is importable from a
+  background runspace. The GUI owns all WinForms. Use
+  `Set-FSLogixLogHandler` if you need to redirect module output
+  somewhere other than the console.
+- **Audit log is critical for live operations.** When a central root
+  was set explicitly, a failed write aborts the operation. A rename
+  that cannot be recorded must not happen.
+- **Cloud Cache is all-or-nothing by default.** Pass `-AllOrNothing`
+  to `Rename-FSLogixProfileObject` to roll back a half-retired replica
+  set; otherwise the surviving copy can resync the dead one back.
+
+## Adding to the module
+
+When you add a new public function:
+
+1. Implement it in `FSLogixProfileCore.psm1`.
+2. Add it to `Export-ModuleMember -Function ...` at the bottom of the
+   file.
+3. Add coverage to `tests/Test-FSLogixProfileCore.ps1`. The test file
+   uses a synthetic tree under `$env:TEMP`; no AD / Hyper-V / Horizon
+   / network share is required.
+4. If the function should be wired into the GUI, add a control and a
+   handler. Wire the handler so the GUI's own confirmation is used
+   (never let the module's `ShouldProcess` prompt fire — pass
+   `-Confirm:$false`).
+
+## Adding a CLI parameter
+
+1. Add it to the `param()` block with the right parameter set.
+2. The `SupportShouldProcess` is on; standard `-WhatIf` / `-Confirm`
+   are auto-generated. Do not add a custom `-WhatIf` switch.
+3. The safety contract is enforced at the top of the script: a bare
+   call with no filter is refused. Update the contract if you change
+   the meaning of `-User` / `-LastUsedDays` / `-All`.
+4. Add a smoke test to `tests/Test-FSLogixResetProfile.ps1` that
+   exercises the new path.
+
+## Important Constraints
+
+- **PowerShell 5.1+** for both entry points; the module requires 5.1.
+- **STA** for the GUI; not for the CLI.
+- **Windows only** (uses `System.Windows.Forms`, `Get-SmbOpenFile`,
+  `Get-VHD`, ADSI, etc.).
+- **No deletion in the module** (see above).
+- **In-use detection is best-effort.** A Cloud Cache session or a
+  long-lived `OpenRead` lease can fool the local probe. Treat
+  `InUse` as a strong signal, `Free` as a weak one.
+
+## Versioning
+
+- v0.7.0 (predecessor) – health monitoring + AD orphan detection.
+- v0.8.0 (current) – shared `FSLogixProfileCore.psm1`, all Phase 0–5
+  backlog items landed (see `BACKLOG.md`).
