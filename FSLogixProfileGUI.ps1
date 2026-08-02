@@ -188,10 +188,17 @@ function Export-GridToCSV {
     [void]$sb.AppendLine(($headers -join ","))
 
     foreach ($row in $Grid.Rows) {
+        $obj = $row.Tag
         $values = @()
         foreach ($cell in $row.Cells) {
-            # 0 / $false / $null are real data; only empty string is "no data".
-            $val = if ($null -ne $cell.Value) { $cell.Value.ToString() } else { "" }
+            $val = ""
+            # The SIDs cell is truncated for display ("... (+N more)"). Export
+            # the full list from the profile object so the CSV is complete.
+            if ($obj -and $cell.ColumnIndex -eq 7 -and $obj.SIDs) {
+                $val = ($obj.SIDs | Sort-Object) -join '; '
+            } else {
+                $val = if ($null -ne $cell.Value) { $cell.Value.ToString() } else { "" }
+            }
             $val = $val -replace "`"", "`"`""
             $values += "`"$val`""
         }
@@ -424,7 +431,9 @@ function Show-RenamePreviewDialog {
     $previewForm.AcceptButton = $btnCancel
     $previewForm.CancelButton = $btnCancel
 
-    return $previewForm.ShowDialog()
+    $result = $previewForm.ShowDialog()
+    $previewForm.Dispose()
+    return $result
 }
 
 # --------------------------------------------------------------------
@@ -944,6 +953,11 @@ function Show-ProfilesInGrid {
     if ($null -ne $priorTopRow -and $priorTopRow -ge 0 -and $priorTopRow -lt $grid.Rows.Count) {
         $grid.FirstDisplayedScrollingRowIndex = $priorTopRow
     }
+
+    # The sort glyph would otherwise go stale after a filter or rescan.
+    if ($script:SortColumn -ge 0 -and $script:SortColumn -lt $grid.Columns.Count) {
+        $grid.Columns[$script:SortColumn].HeaderCell.SortGlyphDirection = if ($script:SortAscending) { "Ascending" } else { "Descending" }
+    }
 }
 
 function Refresh-RowHighlights {
@@ -986,8 +1000,10 @@ $grid.Add_ColumnHeaderMouseClick({
         3 { $profiles | Sort-Object { if ($_.MaxSizeGB) { $_.MaxSizeGB } else { -1 } } }
         4 { $profiles | Sort-Object OfficeSizeGB }
         5 { $profiles | Sort-Object LastWriteTime }
-        6 { $profiles | Sort-Object { ($_.HealthIssues | Measure-Object).Count } }
-        7 { $profiles | Sort-Object { ($_.SIDs | Measure-Object).Count } }
+        # Status and SIDs sort by the displayed text (the same thing the user sees
+        # in the cell), not by the count of items behind them.
+        6 { $profiles | Sort-Object { ($_.HealthIssues | Sort-Object) -join ', ' } }
+        7 { $profiles | Sort-Object { ($_.SIDs       | Sort-Object) -join '; ' } }
         8 { $profiles | Sort-Object RootFolder }
         default { $profiles }
     }
@@ -1010,36 +1026,220 @@ $grid.Add_ColumnHeaderMouseClick({
 })
 
 # --------------------------------------------------------------------
+#  Background scan state
+# --------------------------------------------------------------------
+# Module work runs in a runspace so the UI thread is never blocked. The runspace
+# enqueues log/result records into a ConcurrentQueue; a WinForms Timer on the UI
+# thread drains the queue and updates the form.
+$script:ScanState = @{
+    PowerShell = $null
+    Async      = $null
+    Queue      = $null
+    Result     = $null
+    Exception  = $null
+    Cancelled  = $false
+    Timer      = $null
+    Form       = $null
+    Roots      = @()
+}
+
+function Start-BackgroundScan {
+    param(
+        [string[]]$Roots,
+        [bool]$CheckOrphans
+    )
+
+    # Tear down any previous scan.
+    if ($script:ScanState.PowerShell) {
+        try { $script:ScanState.PowerShell.Stop() } catch { }
+    }
+    if ($script:ScanState.Timer) {
+        try { $script:ScanState.Timer.Stop() } catch { }
+        try { $script:ScanState.Timer.Dispose() } catch { }
+    }
+    if ($script:ScanState.Form) {
+        try { $script:ScanState.Form.Dispose() } catch { }
+    }
+
+    $script:ScanState.Roots     = $Roots
+    $script:ScanState.Queue     = [System.Collections.Concurrent.ConcurrentQueue[PSCustomObject]]::new()
+    $script:ScanState.Result    = $null
+    $script:ScanState.Exception = $null
+    $script:ScanState.Cancelled = $false
+
+    $btnLoad.Enabled    = $false
+    $btnRescan.Enabled  = $false
+    $btnDelete.Enabled  = $false
+    $btnExport.Enabled  = $false
+
+    # Progress form
+    $pf = New-Object System.Windows.Forms.Form
+    $pf.Text = "Scanning profiles..."
+    $pf.Size = New-Object System.Drawing.Size(480, 190)
+    $pf.StartPosition = "CenterParent"
+    $pf.FormBorderStyle = "FixedDialog"
+    $pf.MinimizeBox = $false
+    $pf.MaximizeBox = $false
+    $pf.ControlBox = $false
+    $pf.ShowInTaskbar = $false
+
+    $pfTitle = New-Object System.Windows.Forms.Label
+    $pfTitle.Text = "Scanning $($Roots.Count) profile root(s)..."
+    $pfTitle.Location = New-Object System.Drawing.Point(12, 12)
+    $pfTitle.Size = New-Object System.Drawing.Size(450, 22)
+    $pfTitle.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
+    $pf.Controls.Add($pfTitle)
+
+    $pfStatus = New-Object System.Windows.Forms.Label
+    $pfStatus.Text = "Starting..."
+    $pfStatus.Location = New-Object System.Drawing.Point(12, 40)
+    $pfStatus.Size = New-Object System.Drawing.Size(450, 22)
+    $pf.Controls.Add($pfStatus)
+
+    $pfBar = New-Object System.Windows.Forms.ProgressBar
+    $pfBar.Location = New-Object System.Drawing.Point(12, 70)
+    $pfBar.Size = New-Object System.Drawing.Size(450, 22)
+    $pfBar.Style = "Marquee"
+    $pf.Controls.Add($pfBar)
+
+    $pfRoots = New-Object System.Windows.Forms.Label
+    $pfRoots.Text = "Roots: $($Roots -join '; ')"
+    $pfRoots.Location = New-Object System.Drawing.Point(12, 100)
+    $pfRoots.Size = New-Object System.Drawing.Size(450, 22)
+    $pfRoots.ForeColor = [System.Drawing.Color]::DarkGray
+    $pfRoots.Font = New-Object System.Drawing.Font("Segoe UI", 7.5)
+    $pf.Controls.Add($pfRoots)
+
+    $pfCancel = New-Object System.Windows.Forms.Button
+    $pfCancel.Text = "Cancel"
+    $pfCancel.Location = New-Object System.Drawing.Point(370, 130)
+    $pfCancel.Size = New-Object System.Drawing.Size(90, 30)
+    $pfCancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+    $pf.Controls.Add($pfCancel)
+
+    $pfCancel.Add_Click({
+        $script:ScanState.Cancelled = $true
+        if ($script:ScanState.PowerShell) {
+            try { $script:ScanState.PowerShell.Stop() } catch { }
+        }
+    })
+
+    $script:ScanState.Form = $pf
+
+    # Runspace
+    $rs = [runspacefactory]::CreateRunspace()
+    $rs.ApartmentState = 'MTA'
+    $rs.ThreadOptions = 'ReuseThread'
+    $rs.Open()
+    $rs.SessionStateProxy.SetVariable('ScanQueue', $script:ScanState.Queue)
+
+    $ps = [powershell]::Create()
+    $ps.Runspace = $rs
+
+    $modPath = (Resolve-Path (Join-Path $PSScriptRoot 'FSLogixProfileCore.psm1')).Path
+
+    $ps.AddScript({
+        param($mp, $r, $o)
+        try {
+            Import-Module $mp -Force
+            Set-FSLogixLogHandler {
+                param($m, $l)
+                $ScanQueue.Enqueue([PSCustomObject]@{Message = $m; Level = $l})
+            }
+            $result = @(Get-FSLogixProfiles -ProfileRoots $r -CheckOrphans:$o)
+            $ScanQueue.Enqueue([PSCustomObject]@{Result = $result; Done = $true})
+        } catch {
+            $ScanQueue.Enqueue([PSCustomObject]@{Error = $_.Exception.Message; Done = $true})
+        }
+    }).AddArgument($modPath).AddArgument($Roots).AddArgument([bool]$CheckOrphans)
+
+    $script:ScanState.PowerShell = $ps
+    $script:ScanState.Async      = $ps.BeginInvoke()
+
+    # Timer drains the queue on the UI thread.
+    $timer = New-Object System.Windows.Forms.Timer
+    $timer.Interval = 100
+    $timer.Add_Tick({
+        $item = $null
+        while ($script:ScanState.Queue.TryDequeue([ref]$item)) {
+            if ($item.Done) {
+                $timer.Stop()
+                if ($item.Error) { $script:ScanState.Exception = $item.Error }
+                else            { $script:ScanState.Result = $item.Result }
+                try { $script:ScanState.Form.Close() } catch { }
+                On-ScanComplete
+                return
+            }
+            if ($item.Level -eq 'PROGRESS' -or $item.Level -eq 'INFO') {
+                $pfStatus = $script:ScanState.Form.Controls[1]
+                try { $pfStatus.Text = $item.Message } catch { }
+            }
+        }
+    })
+    $script:ScanState.Timer = $timer
+    $timer.Start()
+
+    [void]$pf.ShowDialog($form)
+}
+
+function On-ScanComplete {
+    $btnLoad.Enabled    = $true
+    $btnRescan.Enabled  = $true
+    $btnDelete.Enabled  = $true
+    $btnExport.Enabled  = $true
+
+    if ($script:ScanState.Form) {
+        try { $script:ScanState.Form.Dispose() } catch { }
+        $script:ScanState.Form = $null
+    }
+    if ($script:ScanState.Timer) {
+        try { $script:ScanState.Timer.Dispose() } catch { }
+        $script:ScanState.Timer = $null
+    }
+    if ($script:ScanState.PowerShell) {
+        try { $script:ScanState.PowerShell.EndInvoke($script:ScanState.Async) } catch { }
+        try { $script:ScanState.PowerShell.Runspace.Close() } catch { }
+        try { $script:ScanState.PowerShell.Runspace.Dispose() } catch { }
+        try { $script:ScanState.PowerShell.Dispose() } catch { }
+    }
+
+    if ($script:ScanState.Cancelled) {
+        Add-LogMessage "Scan cancelled by user." "WARN"
+        $script:lblStatus.Text = "Scan cancelled."
+    } elseif ($script:ScanState.Exception) {
+        Add-LogMessage "Scan failed: $($script:ScanState.Exception)" "ERROR"
+        $script:lblStatus.Text = "Scan failed."
+        [System.Windows.Forms.MessageBox]::Show("Error: $($script:ScanState.Exception)")
+    } else {
+        $script:AllProfiles = @($script:ScanState.Result)
+        $ageDays = if ($chkAge.Checked) { [int]$numAge.Value } else { 0 }
+        $filtered = @(Select-FSLogixProfile -Source $script:AllProfiles -UserFilter @(,$txtFilter.Text) -AgeDays $ageDays -OnlyIssues:$chkOnlyIssues.Checked)
+        Show-ProfilesInGrid $filtered
+        $issueCount = @($script:AllProfiles | Where-Object { $_.HealthIssues.Count -gt 0 }).Count
+        $script:lblStatus.Text = "Loaded $($filtered.Count) user(s) from $($script:ScanState.Roots.Count) root(s). Issues: $issueCount"
+        Add-LogMessage "Loaded $($filtered.Count) user(s), $issueCount with issues" "INFO"
+    }
+
+    $script:ScanState.PowerShell = $null
+    $script:ScanState.Async      = $null
+    $script:ScanState.Result     = $null
+    $script:ScanState.Exception  = $null
+    $script:ScanState.Cancelled  = $false
+    $script:ScanState.Roots      = @()
+    $script:ScanState.Queue      = $null
+}
+
+# --------------------------------------------------------------------
 #  Load profiles
 # --------------------------------------------------------------------
 function Load-Profiles {
-    try {
-        $script:lblStatus.Text = "Loading..."
-        $form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
-        Add-LogMessage "Loading profiles..." "INFO"
-
-        Clear-FSLogixADCache
-
-        $roots = $txtRoot.Text -split ';' | ForEach-Object { $_.Trim() } | Where-Object { $_ }
-        $script:AllProfiles = @(Get-FSLogixProfiles -ProfileRoots $roots -CheckOrphans:$chkCheckOrphans.Checked)
-
-        $ageDays = if ($chkAge.Checked) { [int]$numAge.Value } else { 0 }
-        $filtered = @(Select-FSLogixProfile -Source $script:AllProfiles -UserFilter @(,$txtFilter.Text) -AgeDays $ageDays -OnlyIssues:$chkOnlyIssues.Checked)
-
-        Show-ProfilesInGrid $filtered
-
-        $issueCount = @($script:AllProfiles | Where-Object { $_.HealthIssues.Count -gt 0 }).Count
-        $script:lblStatus.Text = "Loaded $($filtered.Count) user(s) from $($roots.Count) root(s). Issues: $issueCount"
-        Add-LogMessage "Loaded $($filtered.Count) user(s), $issueCount with issues" "INFO"
+    Clear-FSLogixADCache
+    $roots = $txtRoot.Text -split ';' | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+    if ($roots.Count -eq 0) {
+        [System.Windows.Forms.MessageBox]::Show("No profile roots specified.")
+        return
     }
-    catch {
-        [System.Windows.Forms.MessageBox]::Show("Error: $($_.Exception.Message)")
-        $script:lblStatus.Text = "Error loading profiles."
-        Add-LogMessage "Error: $($_.Exception.Message)" "ERROR"
-    }
-    finally {
-        $form.Cursor = [System.Windows.Forms.Cursors]::Default
-    }
+    Start-BackgroundScan -Roots $roots -CheckOrphans $chkCheckOrphans.Checked
 }
 
 $btnLoad.Add_Click({ Load-Profiles })
