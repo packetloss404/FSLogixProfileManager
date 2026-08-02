@@ -245,9 +245,15 @@ check at all.
 
 ## Not doing
 
+(Folded from `CHANGELOG.md` "Maybe someday" — kept here as the single
+backlog.)
+
 - Container compaction / shrink (`Optimize-VHD`, `Invoke-FslShrinkDisk`). The
   most-requested feature for a tool that already measures size, but it is a
   different risk class from rename-and-restore and deserves its own decision.
+- VHD repair (run chkdsk/Repair-Volume on containers). Useful, but FSLogix
+  hands out a temp profile on a broken container — restore from the previous
+  retired copy is the supported answer for now.
 - Read-only mount of a retired container to pull a user's files back out.
   Natural follow-on to Restore; not scoped here.
 - JEA endpoint for access control. The proportionate answer for a
@@ -256,3 +262,11 @@ check at all.
   and the UI gate would only be convenience — say so in the README.
 - Per-folder ACL validation against the owning SID. Catches the most common
   real-world FSLogix support case; worth doing, but after the above.
+- Scheduled / automated renames. The CLI is the schedulable tool; a wrapper
+  around it with `-User` / `-LastUsedDays` is a few lines and doesn't need
+  to live in the repo.
+- Custom rename patterns (something other than `-old-<batch-stamp>`). The
+  timestamped suffix is part of the audit story now; a custom pattern
+  would break the retired-container report.
+- GUI keyboard shortcuts. Nice-to-have, but a WinForms shortcut layer
+  is a separate effort.

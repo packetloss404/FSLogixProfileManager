@@ -2,49 +2,87 @@
 
 ## Unreleased
 
-Groundwork for v0.8.0. **No behaviour change yet** — the GUI and CLI are still the
-v0.7.0 scripts and do not import the new module.
+Groundwork for v0.8.0. The GUI and CLI now import `FSLogixProfileCore.psm1`; the
+duplicated local copies of scan/filter/retire/in-use/AD/health logic are gone.
 
-**New: `FSLogixProfileCore.psm1`** – the scan, classify, filter, retire, restore and
-purge core, extracted so the GUI and CLI stop maintaining two diverged copies. No
-WinForms dependency, so it can run in a background runspace.
+**Wired into the GUI (`FSLogixProfileGUI.ps1`):**
 
-Fixed in the core (see `BACKLOG.md` for the full audit):
+- LIVE / SIMULATION banner on the preview dialog, with operator, user count,
+  scope, in-use check and Horizon status.
+- Cancel is now the AcceptButton on the preview; auto-select of row 0 after
+  a load is cleared so the empty-selection guard is no longer dead.
+- Proportionate confirmation: lists up to 5 users + "+N more", shows the
+  container count, defaults to No, and above a threshold requires the
+  operator to type the container count.
+- Result counts (renamed / in-use / exists / missing / failed / aborted)
+  come from the module's structured return and render into the status bar
+  and a result dialog.
+- The Reset button is red and reads "Reset Profile - LIVE" whenever
+  WhatIf is off; restored when WhatIf comes back on. Survives rescan and
+  theme changes.
+- WhatIf runs no longer trigger a second full-share freeze.
+- The scan runs in a background runspace with a Cancel button, draining
+  progress through a ConcurrentQueue via a WinForms Timer on the UI
+  thread. The UI no longer ghosts during a large share scan.
+- Reason / Ticket text box, required for any live run (WhatIf is still
+  allowed without one). The reason is written to the audit log on every
+  renamed row.
+- AD Last Logon column surfaces `lastLogonTimestamp`, with a parallel
+  "AD last logon > N days" filter plumbed through `Select-FSLogixProfile
+  -ADLastLogonDays`. The on-disk age filter still works the same way.
+- Horizon connect dialog (server / user / domain / password / optional
+  skip-cert for labs). Connection state surfaces in the preview banner.
+- Settings dialog for the audit root, with a "use default" jump back to
+  `%ProgramData%` for homelabs. An explicitly-set central path means a
+  failed audit write aborts the operation.
+- Retired-containers dialog with batch Restore and gated Purge. Last-copy
+  rows are tinted; the dialog auto-adds `-AllowLastCopy` and/or
+  `-IncludeUndated` only when the selection actually needs them.
+- "Move to retired" checkbox (default on): retired files land under
+  `<root>\_retired\<user>\<batch-stamp>\` instead of in the user's
+  writable directory. They stop counting against the user's FSRM quota
+  and fall outside the user's ACL scope.
+- Sort glyph persists across filter/rescan; Status and SIDs sort by the
+  displayed text, not by item count; the "Used GB" column is renamed
+  to "Size (GB)"; the log panel no longer dies at ~32 KB
+  (`MaxLength = 0`); the preview form is disposed; CSV exports the full
+  SID list and respects the user's column reorder.
 
-- Retired `*-old` containers are no longer re-scanned or re-renamed. Previously a
-  second reset skipped the *live* container (its `-old` target already existed) and
-  renamed the previous backup to `-old-old`, while reporting success.
-- `-Filter *.vhd*` is a prefix match, so Cloud Cache `.meta` / `.metadata` / `.lock`
-  sidecars were counted as containers and renamed. Now filtered on real extension.
-- Retire suffix is now `-old-yyyyMMdd-HHmmss`, which cannot collide, groups a batch,
-  and records when a container was retired.
-- SID-first folder names (FSLogix's *default* `FlipFlopProfileDirectoryName` layout)
-  now parse. Previously nothing matched, and the AD check flagged every profile in
-  the estate as ORPHAN.
-- Container type is classified by positive filename prefix (`Profile_`, `ODFC_`,
-  `O365_`) at discovery. The old `odfc|office` regex ran against the full path in the
-  retire and preview paths, inverting `-OnlyProfile` / `-OnlyOdfc` on a dedicated
-  Office share, and misclassified `O365_*.vhdx`.
-- Orphan detection binds by SID, not by the folder-derived sAMAccountName, so renamed
-  and trusted-domain users are no longer flagged as orphans.
-- A share with exactly one user no longer breaks discovery (scalar unrolling).
-- `Max GB` and `NEAR_LIMIT` come from a real ceiling (Get-VHD or registry
-  `SizeInMBs`) or are left blank — no more guessing from a hardcoded size list.
-- In-use detection distinguishes Free / InUse / AccessDenied / Missing, and prefers
-  `Get-SmbOpenFile` (which also names the holding user and machine).
+**Wired into the CLI (`FSLogixResetProfile.ps1`):**
 
-Added in the core: audit trail, batch restore, retired-container report and gated
-purge, optional Horizon session gate, FSLogix registry policy reader, Cloud Cache
-replica handling with all-or-nothing retire.
+- `[CmdletBinding(SupportsShouldProcess, ConfirmImpact='High')]` replaces
+  the hand-rolled `-WhatIf`. `-WhatIf` and `-Confirm` work the way
+  every other PS advanced function does.
+- A bare call with no filter is refused outright. `-User`, `-LastUsedDays`
+  or an explicit `-All` is required.
+- In-use checking defaults to `$true`. `-CheckInUse:$false` opts out.
+- `-OnlyOdfc` and `-OnlyProfile` collapse into `-Scope` (All / Office /
+  Profile).
+- `-Force` passes through to the module's retire (allow unresolved
+  identities).
+- Multi-root via `-ProfileRoots` as a parameter set, or `-ProfileRoot`
+  that splits on `;`.
 
-**New: `tests/Test-FSLogixProfileCore.ps1`** – 30 checks over the pure logic and a
-synthetic share. No AD, Hyper-V, Horizon or network required.
+**Module (`FSLogixProfileCore.psm1`):**
 
-**New: `.gitignore`** – keeps `FSLogix_Rename_*.log` and exported CSVs out of the repo.
+- `Rename-FSLogixProfileObject` and `Get-FSLogixRetirePlan` now accept a
+  `-MoveToRetired` switch that retires into `<root>\_retired\<user>\<stamp>\`.
 
-Also: absorbed `FSLogixResetProfile.ps1` into this repo (`5d0d08b`) and removed
-leftover DEBUG MAP scaffolding from both scripts (`21ba003`) — neither was recorded
-here at the time.
+**Tests:**
+
+- `tests/Test-FSLogixProfileCore.ps1` — 39 checks. Added coverage for
+  `Rename-FSLogixProfileObject` under `-WhatIf` and under `-MoveToRetired`.
+- `tests/Test-FSLogixResetProfile.ps1` (new) — 13 CLI smoke tests for the
+  safety contract: bare-call refusal, `-All` opt-in, `-LastUsedDays`,
+  `-User`, `WhatIf` routing through `SupportsShouldProcess`, unknown
+  user, help text.
+
+**New: `.gitignore`** — keeps `FSLogix_Rename_*.log` and exported CSVs out
+of the repo.
+
+Also: absorbed `FSLogixResetProfile.ps1` into this repo (`5d0d08b`) and
+removed leftover DEBUG MAP scaffolding from both scripts (`21ba003`) —
+neither was recorded here at the time.
 
 ## v0.7.0
 
@@ -209,12 +247,8 @@ Window is bigger now (1100x800) to fit everything.
 
 ## Maybe someday
 
-- Scheduled/automated renames
-- Custom rename patterns (something other than `-old`)
-- Undo/restore (rename back from `-old`)
-- Keyboard shortcuts
-- VHD compaction (reclaim whitespace)
-- VHD repair (run chkdsk/Repair-Volume on containers)
+(These belong in `BACKLOG.md` now — moved to the "Not doing" section
+there. Kept here only as a pointer.)
 
 ---
 
