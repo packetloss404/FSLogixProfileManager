@@ -314,8 +314,192 @@ function Show-ResetConfirmation {
 }
 
 # --------------------------------------------------------------------
-#  Rename Preview Dialog
+#  Horizon connect dialog
 # --------------------------------------------------------------------
+function Show-HorizonConnectDialog {
+    $dlg = New-Object System.Windows.Forms.Form
+    $dlg.Text = "Connect to Horizon Connection Server"
+    $dlg.Size = New-Object System.Drawing.Size(440, 260)
+    $dlg.StartPosition = "CenterParent"
+    $dlg.FormBorderStyle = "FixedDialog"
+    $dlg.MinimizeBox = $false
+    $dlg.MaximizeBox = $false
+
+    $lblServer = New-Object System.Windows.Forms.Label
+    $lblServer.Text = "Server:"
+    $lblServer.Location = New-Object System.Drawing.Point(12, 16)
+    $lblServer.AutoSize = $true
+    $dlg.Controls.Add($lblServer)
+
+    $txtServer = New-Object System.Windows.Forms.TextBox
+    $txtServer.Location = New-Object System.Drawing.Point(110, 13)
+    $txtServer.Size = New-Object System.Drawing.Size(300, 22)
+    $dlg.Controls.Add($txtServer)
+
+    $lblUser = New-Object System.Windows.Forms.Label
+    $lblUser.Text = "Username:"
+    $lblUser.Location = New-Object System.Drawing.Point(12, 46)
+    $lblUser.AutoSize = $true
+    $dlg.Controls.Add($lblUser)
+
+    $txtUser = New-Object System.Windows.Forms.TextBox
+    $txtUser.Location = New-Object System.Drawing.Point(110, 43)
+    $txtUser.Size = New-Object System.Drawing.Size(300, 22)
+    $dlg.Controls.Add($txtUser)
+
+    $lblDomain = New-Object System.Windows.Forms.Label
+    $lblDomain.Text = "Domain:"
+    $lblDomain.Location = New-Object System.Drawing.Point(12, 76)
+    $lblDomain.AutoSize = $true
+    $dlg.Controls.Add($lblDomain)
+
+    $txtDomain = New-Object System.Windows.Forms.TextBox
+    $txtDomain.Location = New-Object System.Drawing.Point(110, 73)
+    $txtDomain.Size = New-Object System.Drawing.Size(300, 22)
+    $dlg.Controls.Add($txtDomain)
+
+    $lblPass = New-Object System.Windows.Forms.Label
+    $lblPass.Text = "Password:"
+    $lblPass.Location = New-Object System.Drawing.Point(12, 106)
+    $lblPass.AutoSize = $true
+    $dlg.Controls.Add($lblPass)
+
+    $txtPass = New-Object System.Windows.Forms.TextBox
+    $txtPass.Location = New-Object System.Drawing.Point(110, 103)
+    $txtPass.Size = New-Object System.Drawing.Size(300, 22)
+    $txtPass.UseSystemPasswordChar = $true
+    $dlg.Controls.Add($txtPass)
+
+    $chkSkipCert = New-Object System.Windows.Forms.CheckBox
+    $chkSkipCert.Text = "Skip certificate check (lab only)"
+    $chkSkipCert.Location = New-Object System.Drawing.Point(110, 132)
+    $chkSkipCert.AutoSize = $true
+    $dlg.Controls.Add($chkSkipCert)
+
+    $lblStatus = New-Object System.Windows.Forms.Label
+    $lblStatus.Location = New-Object System.Drawing.Point(12, 160)
+    $lblStatus.Size = New-Object System.Drawing.Size(400, 40)
+    $lblStatus.ForeColor = [System.Drawing.Color]::DarkRed
+    $dlg.Controls.Add($lblStatus)
+
+    $btnCancel = New-Object System.Windows.Forms.Button
+    $btnCancel.Text = "Cancel"
+    $btnCancel.Location = New-Object System.Drawing.Point(330, 200)
+    $btnCancel.Size = New-Object System.Drawing.Size(80, 28)
+    $btnCancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+    $dlg.Controls.Add($btnCancel)
+
+    $btnConnect = New-Object System.Windows.Forms.Button
+    $btnConnect.Text = "Connect"
+    $btnConnect.Location = New-Object System.Drawing.Point(240, 200)
+    $btnConnect.Size = New-Object System.Drawing.Size(80, 28)
+    $btnConnect.DialogResult = [System.Windows.Forms.DialogResult]::OK
+    $dlg.Controls.Add($btnConnect)
+
+    $dlg.AcceptButton = $btnConnect
+    $dlg.CancelButton = $btnCancel
+
+    if ($dlg.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) { return }
+
+    if ([string]::IsNullOrWhiteSpace($txtServer.Text) -or [string]::IsNullOrWhiteSpace($txtUser.Text)) {
+        [System.Windows.Forms.MessageBox]::Show("Server and username are required.")
+        return
+    }
+
+    $secPass = ConvertTo-SecureString $txtPass.Text -AsPlainText -Force
+    $cred    = New-Object System.Management.Automation.PSCredential($txtUser.Text, $secPass)
+    $domain  = if ([string]::IsNullOrWhiteSpace($txtDomain.Text)) { $null } else { $txtDomain.Text }
+
+    try {
+        Connect-FSLogixHorizon -Server $txtServer.Text -Credential $cred -Domain $domain -SkipCertificateCheck:$chkSkipCert.Checked
+        Add-LogMessage "Connected to Horizon: $txtServer.Text" "INFO"
+        [System.Windows.Forms.MessageBox]::Show("Connected to $($txtServer.Text).", "Horizon", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
+    } catch {
+        Add-LogMessage "Horizon connect failed: $($_.Exception.Message)" "ERROR"
+        [System.Windows.Forms.MessageBox]::Show("Failed: $($_.Exception.Message)", "Horizon", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
+    }
+}
+
+# --------------------------------------------------------------------
+#  Settings dialog (audit root)
+# --------------------------------------------------------------------
+function Show-SettingsDialog {
+    $currentRoot = Get-FSLogixAuditRoot
+    $currentExplicit = $script:AuditRootIsExplicit
+
+    $dlg = New-Object System.Windows.Forms.Form
+    $dlg.Text = "Settings"
+    $dlg.Size = New-Object System.Drawing.Size(560, 200)
+    $dlg.StartPosition = "CenterParent"
+    $dlg.FormBorderStyle = "FixedDialog"
+    $dlg.MinimizeBox = $false
+    $dlg.MaximizeBox = $false
+
+    $lblRoot = New-Object System.Windows.Forms.Label
+    $lblRoot.Text = "Audit root (where the monthly CSV files are written):"
+    $lblRoot.Location = New-Object System.Drawing.Point(12, 16)
+    $lblRoot.AutoSize = $true
+    $dlg.Controls.Add($lblRoot)
+
+    $txtRoot = New-Object System.Windows.Forms.TextBox
+    $txtRoot.Location = New-Object System.Drawing.Point(12, 38)
+    $txtRoot.Size = New-Object System.Drawing.Size(450, 22)
+    $txtRoot.Text = $currentRoot
+    $dlg.Controls.Add($txtRoot)
+
+    $btnBrowse = New-Object System.Windows.Forms.Button
+    $btnBrowse.Text = "Browse..."
+    $btnBrowse.Location = New-Object System.Drawing.Point(470, 36)
+    $btnBrowse.Size = New-Object System.Drawing.Size(60, 26)
+    $dlg.Controls.Add($btnBrowse)
+
+    $btnBrowse.Add_Click({
+        $folder = New-Object System.Windows.Forms.FolderBrowserDialog
+        $folder.Description = "Select the audit root directory"
+        $folder.SelectedPath = $txtRoot.Text
+        if ($folder.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+            $txtRoot.Text = $folder.SelectedPath
+        }
+    })
+
+    $lblNote = New-Object System.Windows.Forms.Label
+    $lblNote.Text = "If set explicitly, a failed audit write aborts the operation. Leave at the default local path for homelabs."
+    $lblNote.Location = New-Object System.Drawing.Point(12, 70)
+    $lblNote.Size = New-Object System.Drawing.Size(520, 30)
+    $lblNote.ForeColor = [System.Drawing.Color]::Gray
+    $lblNote.Font = New-Object System.Drawing.Font("Segoe UI", 7.5)
+    $dlg.Controls.Add($lblNote)
+
+    $btnReset = New-Object System.Windows.Forms.Button
+    $btnReset.Text = "Use default"
+    $btnReset.Location = New-Object System.Drawing.Point(12, 110)
+    $btnReset.Size = New-Object System.Drawing.Size(100, 26)
+    $dlg.Controls.Add($btnReset)
+    $btnReset.Add_Click({ $txtRoot.Text = (Join-Path $env:ProgramData 'FSLogixProfileManager\Audit') })
+
+    $btnCancel = New-Object System.Windows.Forms.Button
+    $btnCancel.Text = "Cancel"
+    $btnCancel.Location = New-Object System.Drawing.Point(450, 140)
+    $btnCancel.Size = New-Object System.Drawing.Size(80, 28)
+    $btnCancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+    $dlg.Controls.Add($btnCancel)
+
+    $btnSave = New-Object System.Windows.Forms.Button
+    $btnSave.Text = "Save"
+    $btnSave.Location = New-Object System.Drawing.Point(360, 140)
+    $btnSave.Size = New-Object System.Drawing.Size(80, 28)
+    $btnSave.DialogResult = [System.Windows.Forms.DialogResult]::OK
+    $dlg.Controls.Add($btnSave)
+
+    $dlg.AcceptButton = $btnSave
+    $dlg.CancelButton = $btnCancel
+
+    if ($dlg.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) { return }
+
+    Set-FSLogixAuditRoot -Path $txtRoot.Text
+    $script:AuditRootIsExplicit = $true
+    Add-LogMessage "Audit root set to: $($txtRoot.Text)" "INFO"
+}
 function Show-RenamePreviewDialog {
     param(
         $SelectedProfiles,
@@ -622,7 +806,7 @@ try {
 }
 
 $btnGithub = New-Object System.Windows.Forms.Button
-$btnGithub.Location = New-Object System.Drawing.Point(1120, 10)
+$btnGithub.Location = New-Object System.Drawing.Point(1158, 10)
 $btnGithub.Size     = New-Object System.Drawing.Size(28, 28)
 $btnGithub.FlatStyle = 'Flat'
 $btnGithub.FlatAppearance.BorderSize = 0
@@ -640,6 +824,20 @@ $btnGithub.Add_Click({
 })
 
 $form.Controls.Add($btnGithub)
+
+# Horizon connect button
+$btnHorizon = New-Object System.Windows.Forms.Button
+$btnHorizon.Text = "Horizon..."
+$btnHorizon.Location = New-Object System.Drawing.Point(985, 10)
+$btnHorizon.Size = New-Object System.Drawing.Size(80, 28)
+$form.Controls.Add($btnHorizon)
+
+# Settings button (audit root, etc.)
+$btnSettings = New-Object System.Windows.Forms.Button
+$btnSettings.Text = "Settings..."
+$btnSettings.Location = New-Object System.Drawing.Point(1070, 10)
+$btnSettings.Size = New-Object System.Drawing.Size(80, 28)
+$form.Controls.Add($btnSettings)
 
 # --- Row 2: Filter / Age / WhatIf / Highlight ---
 
@@ -1492,6 +1690,9 @@ $btnDelete.Add_Click({
 })
 
 $btnClose.Add_Click({ $form.Close() })
+
+$btnHorizon.Add_Click({ Show-HorizonConnectDialog })
+$btnSettings.Add_Click({ Show-SettingsDialog })
 
 # --------------------------------------------------------------------
 #  Apply initial theme and start
