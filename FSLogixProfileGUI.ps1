@@ -750,13 +750,55 @@ $lblLegendOrphan.ForeColor = [System.Drawing.Color]::Goldenrod
 $lblLegendOrphan.Font = New-Object System.Drawing.Font("Segoe UI", 7)
 $form.Controls.Add($lblLegendOrphan)
 
+# --- Row 3: Reason / Ticket + AD Last Logon filter ---
+
+$lblReason = New-Object System.Windows.Forms.Label
+$lblReason.Text = "Reason/Ticket:"
+$lblReason.Location = New-Object System.Drawing.Point(10, 82)
+$lblReason.AutoSize = $true
+$form.Controls.Add($lblReason)
+
+$txtReason = New-Object System.Windows.Forms.TextBox
+$txtReason.Location = New-Object System.Drawing.Point(105, 79)
+$txtReason.Size = New-Object System.Drawing.Size(340, 22)
+$form.Controls.Add($txtReason)
+
+$chkADAge = New-Object System.Windows.Forms.CheckBox
+$chkADAge.Text = "AD last logon >"
+$chkADAge.Location = New-Object System.Drawing.Point(460, 82)
+$chkADAge.AutoSize = $true
+$form.Controls.Add($chkADAge)
+
+$numADAge = New-Object System.Windows.Forms.NumericUpDown
+$numADAge.Location = New-Object System.Drawing.Point(575, 79)
+$numADAge.Minimum = 1
+$numADAge.Maximum = 3650
+$numADAge.Value = 90
+$numADAge.Size = New-Object System.Drawing.Size(50, 22)
+$form.Controls.Add($numADAge)
+
+$lblADAgeDays = New-Object System.Windows.Forms.Label
+$lblADAgeDays.Text = "days"
+$lblADAgeDays.Location = New-Object System.Drawing.Point(630, 82)
+$lblADAgeDays.AutoSize = $true
+$form.Controls.Add($lblADAgeDays)
+
+# Hint that the reason is required for live runs.
+$lblReasonHint = New-Object System.Windows.Forms.Label
+$lblReasonHint.Text = "(required for live runs)"
+$lblReasonHint.Location = New-Object System.Drawing.Point(680, 82)
+$lblReasonHint.AutoSize = $true
+$lblReasonHint.ForeColor = [System.Drawing.Color]::Gray
+$lblReasonHint.Font = New-Object System.Drawing.Font("Segoe UI", 7)
+$form.Controls.Add($lblReasonHint)
+
 # --- SplitContainer for Grid + Log Panel ---
 
 $splitContainer = New-Object System.Windows.Forms.SplitContainer
-$splitContainer.Location = New-Object System.Drawing.Point(10, 85)
-$splitContainer.Size = New-Object System.Drawing.Size(1160, 620)
+$splitContainer.Location = New-Object System.Drawing.Point(10, 110)
+$splitContainer.Size = New-Object System.Drawing.Size(1160, 595)
 $splitContainer.Orientation = "Horizontal"
-$splitContainer.SplitterDistance = 480
+$splitContainer.SplitterDistance = 470
 $splitContainer.Panel1MinSize = 200
 $splitContainer.Panel2MinSize = 80
 $splitContainer.Anchor = "Top,Left,Right,Bottom"
@@ -790,15 +832,16 @@ function Add-Col([string]$header, [int]$width, [string]$sortMode = "Automatic") 
     [void]$grid.Columns.Add($col)
 }
 
-Add-Col "User"         120 "Programmatic"  # col 0
-Add-Col "# Cont"        55 "Programmatic"  # col 1
-Add-Col "Size (GB)"     75 "Programmatic"  # col 2  (was "Used GB")
-Add-Col "Max GB"        60 "Programmatic"  # col 3
-Add-Col "Office GB"     70 "Programmatic"  # col 4
-Add-Col "Last Write"   120 "Programmatic"  # col 5
-Add-Col "Status"       130 "Programmatic"  # col 6
-Add-Col "SIDs"         180 "Programmatic"  # col 7
-Add-Col "Root Folder"  300 "Programmatic"  # col 8
+Add-Col "User"           120 "Programmatic"  # col 0
+Add-Col "# Cont"          55 "Programmatic"  # col 1
+Add-Col "Size (GB)"       75 "Programmatic"  # col 2  (was "Used GB")
+Add-Col "Max GB"          60 "Programmatic"  # col 3
+Add-Col "Office GB"       70 "Programmatic"  # col 4
+Add-Col "Last Write"     120 "Programmatic"  # col 5
+Add-Col "Status"         150 "Programmatic"  # col 6
+Add-Col "SIDs"           180 "Programmatic"  # col 7
+Add-Col "AD Last Logon"  120 "Programmatic"  # col 8
+Add-Col "Root Folder"    300 "Programmatic"  # col 9
 
 # --- Log Panel ---
 
@@ -932,7 +975,13 @@ function Show-ProfilesInGrid {
         }
         $row.Cells[7].ToolTipText = ($sidList -join "`n")
 
-        $row.Cells[8].Value = $p.RootFolder
+        # AD last logon. A null ADLastLogon means "not known" - render blank,
+        # never as a fake date. A stale SMB lease can make a mounted
+        # container's LastWriteTime look old, so the AD signal matters.
+        $row.Cells[8].Value = if ($p.ADLastLogon) { $p.ADLastLogon.ToString("yyyy-MM-dd") } else { '' }
+        $row.Cells[8].ToolTipText = if ($p.ADLastLogon) { "AD last logon: $($p.ADLastLogon.ToString('yyyy-MM-dd HH:mm'))" } else { "AD last logon unknown" }
+
+        $row.Cells[9].Value = $p.RootFolder
         $row.Tag = $p
 
         Update-RowHighlight -Row $row `
@@ -1004,7 +1053,9 @@ $grid.Add_ColumnHeaderMouseClick({
         # in the cell), not by the count of items behind them.
         6 { $profiles | Sort-Object { ($_.HealthIssues | Sort-Object) -join ', ' } }
         7 { $profiles | Sort-Object { ($_.SIDs       | Sort-Object) -join '; ' } }
-        8 { $profiles | Sort-Object RootFolder }
+        # AD last logon sorts with unknowns (null) at the end.
+        8 { $profiles | Sort-Object { if ($_.ADLastLogon) { $_.ADLastLogon } else { [datetime]::MaxValue } } }
+        9 { $profiles | Sort-Object RootFolder }
         default { $profiles }
     }
 
@@ -1213,10 +1264,11 @@ function On-ScanComplete {
     } else {
         $script:AllProfiles = @($script:ScanState.Result)
         $ageDays = if ($chkAge.Checked) { [int]$numAge.Value } else { 0 }
+        $adAge   = if ($chkADAge.Checked) { [int]$numADAge.Value } else { 0 }
         # Direct call (not @( ... )) so the module's leading-comma return unwraps
         # cleanly. Wrapping would give a 1-element array containing the real
         # result, which makes .Count always 1 for empty results.
-        $filtered = Select-FSLogixProfile -Source $script:AllProfiles -UserFilter @(,$txtFilter.Text) -AgeDays $ageDays -OnlyIssues:$chkOnlyIssues.Checked
+        $filtered = Select-FSLogixProfile -Source $script:AllProfiles -UserFilter @(,$txtFilter.Text) -AgeDays $ageDays -ADLastLogonDays $adAge -OnlyIssues:$chkOnlyIssues.Checked
         if ($null -eq $filtered) { $filtered = @() }
         Show-ProfilesInGrid $filtered
         $issueCount = @($script:AllProfiles | Where-Object { $_.HealthIssues.Count -gt 0 }).Count
@@ -1257,7 +1309,8 @@ $btnApplyFilter.Add_Click({
     if (-not $script:AllProfiles -or $script:AllProfiles.Count -eq 0) { return }
 
     $ageDays = if ($chkAge.Checked) { [int]$numAge.Value } else { 0 }
-    $filtered = Select-FSLogixProfile -Source $script:AllProfiles -UserFilter @(,$txtFilter.Text) -AgeDays $ageDays -OnlyIssues:$chkOnlyIssues.Checked
+    $adAge   = if ($chkADAge.Checked) { [int]$numADAge.Value } else { 0 }
+    $filtered = Select-FSLogixProfile -Source $script:AllProfiles -UserFilter @(,$txtFilter.Text) -AgeDays $ageDays -ADLastLogonDays $adAge -OnlyIssues:$chkOnlyIssues.Checked
     if ($null -eq $filtered) { $filtered = @() }
 
     Show-ProfilesInGrid $filtered
@@ -1281,6 +1334,12 @@ $chkOnlyIssues.Add_CheckedChanged({
 })
 $numAge.Add_ValueChanged({
     if ($chkAge.Checked -and $script:AllProfiles -and $script:AllProfiles.Count -gt 0) { $btnApplyFilter.PerformClick() }
+})
+$chkADAge.Add_CheckedChanged({
+    if ($script:AllProfiles -and $script:AllProfiles.Count -gt 0) { $btnApplyFilter.PerformClick() }
+})
+$numADAge.Add_ValueChanged({
+    if ($chkADAge.Checked -and $script:AllProfiles -and $script:AllProfiles.Count -gt 0) { $btnApplyFilter.PerformClick() }
 })
 
 $chkHighlight.Add_CheckedChanged({ Refresh-RowHighlights })
@@ -1325,6 +1384,16 @@ $btnDelete.Add_Click({
     $scope        = if ($chkDeleteOdfc.Checked) { 'Office' }
                     elseif ($chkDeleteProfile.Checked) { 'Profile' }
                     else { 'All' }
+    $reason       = $txtReason.Text.Trim()
+
+    # Live runs require a reason - the audit log records it on every row, and
+    # a missing ticket number makes the trail useless. WhatIf is allowed
+    # without one because nothing actually changes.
+    if (-not $whatIf -and [string]::IsNullOrWhiteSpace($reason)) {
+        [System.Windows.Forms.MessageBox]::Show("A reason / ticket number is required for live runs.`n`nWhatIf is still allowed without one.", "Reason required", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning)
+        $txtReason.Focus()
+        return
+    }
 
     $selectedProfiles = @()
     foreach ($row in $grid.SelectedRows) {
@@ -1361,7 +1430,7 @@ $btnDelete.Add_Click({
     $results = @()
     try {
         foreach ($obj in $selectedProfiles) {
-            $r = Rename-FSLogixProfileObject -ProfileObject $obj -Scope $scope -CheckInUse:$checkInUse -Confirm:$false
+            $r = Rename-FSLogixProfileObject -ProfileObject $obj -Scope $scope -CheckInUse:$checkInUse -Reason $reason -Confirm:$false
             $results += $r
         }
     } finally {
