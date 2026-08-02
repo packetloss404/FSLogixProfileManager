@@ -3,325 +3,243 @@
     Command-line FSLogix profile reset tool (rename-based).
 
 .DESCRIPTION
-    Scans an FSLogix profile root (UNC share), groups containers by username,
-    and optionally "resets" profiles by RENAMING containers to add "-old"
-    before the extension.
+    Scans one or more FSLogix profile roots (UNC shares), groups containers by
+    user identity, and retires profiles by RENAMING containers (never deleting).
 
-    It supports:
-      - Targeting specific users (with wildcards).
-      - Filtering by last-used (LastWriteTime in days).
-      - Targeting ONLY ODFC/Office containers, ONLY Profile containers, or ALL.
-      - WhatIf simulation mode (no changes, just logs).
+    A safety contract enforced by this entry point:
+      * At least one of -User / -LastUsedDays / -All is required. A bare call
+        with no filter is refused outright.
+      * -WhatIf is the standard one; -Confirm gates any non-WhatIf run.
+      * In-use detection is on by default. Pass -CheckInUse:$false to disable
+        (off is the unsafe choice).
 
-.NOTES
-    Version: v1 (CLI-only)
+    All scan/classify/retire/restore logic lives in FSLogixProfileCore.psm1.
+    This script is a thin CLI shell over it.
 
-    Default profile root:
-      \\fml-fslogix\FSLogixUserProfiles
+    Breaking changes vs the v1 CLI:
+      * The custom -WhatIf switch is gone. Use the standard -WhatIf that
+        SupportsShouldProcess provides. -Confirm is now wired up too.
+      * The -OnlyOdfc and -OnlyProfile switches are gone. Use -Scope Office /
+        -Scope Profile. -Scope All is the default.
+      * A bare call with no filter is refused (was: retired the entire share).
+      * Scheduled tasks that ran the bare form will now exit with an error.
 
-    Folder naming pattern expected (like Horizon IC lab):
-      username_S-1-5-21-XXXXXXXXX-XXXXXXXXX-XXXXXXXXX-XXXXX
+.PARAMETER ProfileRoot
+    Single FSLogix root (UNC). Default: '\\fml-fslogix\FSLogixUserProfiles'.
+    Accepts a single path; for multiple roots use -ProfileRoots.
 
-    Logs are written per user to %TEMP%:
-      FSLogix_Rename_<username>_<YYYYMMDDHHMMSS>.log
+.PARAMETER ProfileRoots
+    Multiple FSLogix roots (Cloud Cache). Mutually exclusive with -ProfileRoot.
+
+.PARAMETER User
+    Target users. Wildcards allowed. Multiple values allowed.
+
+.PARAMETER LastUsedDays
+    Filter to profiles whose last write is older than this many days.
+
+.PARAMETER All
+    Explicitly opt in to processing every discovered profile. Without -All,
+    a call that has no -User and no -LastUsedDays is refused.
+
+.PARAMETER Scope
+    Which container classes to retire: All (default), Office, or Profile.
+
+.PARAMETER CheckInUse
+    Skip containers that are currently held open. Default: $true. Pass
+    -CheckInUse:$false to override (unsafe).
+
+.PARAMETER ListOnly
+    Show what would be targeted and exit. No rename.
+
+.PARAMETER Force
+    Permit retiring a row whose username and SID could not be parsed out of
+    the share layout. Off by default.
+
+.EXAMPLE
+    # Dry run for one user.
+    .\FSLogixResetProfile.ps1 -User vditest1 -WhatIf
+
+.EXAMPLE
+    # Live: every user whose profile hasn't been touched in 60 days, all
+    # containers, with confirmation prompts.
+    .\FSLogixResetProfile.ps1 -LastUsedDays 60
+
+.EXAMPLE
+    # Multi-root: scan both providers as independent shares.
+    .\FSLogixResetProfile.ps1 -ProfileRoots '\\fs1\Profiles','\\fs2\Profiles' -User vdi* -WhatIf
 #>
 
+[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High')]
 param(
-    # FSLogix profile root (UNC)
-    [string]$ProfileRoot = "\\fml-fslogix\FSLogixUserProfiles",
+    [Parameter(ParameterSetName = 'Single')]
+    [string]$ProfileRoot = '\\fml-fslogix\FSLogixUserProfiles',
 
-    # Target user(s). Supports wildcards. If omitted, all users are considered.
+    [Parameter(ParameterSetName = 'Multi', Mandatory = $true)]
+    [string[]]$ProfileRoots,
+
     [string[]]$User,
 
-    # Filter: only profiles whose last write is older than this many days.
     [int]$LastUsedDays = 0,
 
-    # If set, only Office/ODFC containers (filename contains 'odfc' or 'office') are processed.
-    [switch]$OnlyOdfc,
+    [switch]$All,
 
-    # If set, only non-ODFC (profile) containers are processed.
-    [switch]$OnlyProfile,
+    [ValidateSet('All', 'Office', 'Profile')]
+    [string]$Scope = 'All',
 
-    # If set, no changes are made; actions are logged as "WHATIF".
-    [switch]$WhatIf,
+    [switch]$CheckInUse = $true,
 
-    # If set, show which profiles WOULD be targeted, then exit (no rename).
-    [switch]$ListOnly
+    [switch]$ListOnly,
+
+    [switch]$Force
 )
 
-# --------------------------------------------------------------------------------------------------
-# Validation
-# --------------------------------------------------------------------------------------------------
+$ErrorActionPreference = 'Stop'
 
-Write-Host "FSLogixResetProfile.ps1 - Command-line reset tool (v1)" -ForegroundColor Cyan
-Write-Host "ProfileRoot : $ProfileRoot"
-Write-Host "User filter : $($User -join ', ')" 
-Write-Host "LastUsedDays: $LastUsedDays"
-Write-Host "OnlyOdfc    : $($OnlyOdfc.IsPresent)"
-Write-Host "OnlyProfile : $($OnlyProfile.IsPresent)"
-Write-Host "WhatIf      : $($WhatIf.IsPresent)"
-Write-Host "ListOnly    : $($ListOnly.IsPresent)"
-Write-Host ""
+# --------------------------------------------------------------------------------------------------
+#  Load the shared core
+# --------------------------------------------------------------------------------------------------
+$modulePath = Join-Path $PSScriptRoot 'FSLogixProfileCore.psm1'
+if (-not (Test-Path -LiteralPath $modulePath)) {
+    throw "FSLogixProfileCore.psm1 not found at: $modulePath"
+}
+Import-Module $modulePath -Force
 
-if ($OnlyOdfc -and $OnlyProfile) {
-    Write-Error "You cannot specify both -OnlyOdfc and -OnlyProfile. Choose one or neither."
+# --------------------------------------------------------------------------------------------------
+#  Roots + filter sanity
+# --------------------------------------------------------------------------------------------------
+if ($PSCmdlet.ParameterSetName -eq 'Single') {
+    $roots = if ($ProfileRoot -match ';') {
+        $ProfileRoot -split ';' | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+    } else {
+        @($ProfileRoot)
+    }
+} else {
+    $roots = @($ProfileRoots | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+}
+
+if ($roots.Count -eq 0) {
+    Write-Error "No profile roots specified."
     exit 1
 }
 
-if (-not (Test-Path $ProfileRoot)) {
-    Write-Error "Profile root not found: $ProfileRoot"
+# Bare call with no filter: refused. This is the headline safety fix.
+if (-not $User -and $LastUsedDays -le 0 -and -not $All) {
+    Write-Error "Refusing to run with no filter. Specify -User, -LastUsedDays, or -All."
     exit 1
 }
 
-# --------------------------------------------------------------------------------------------------
-#  FSLogix scan + username detection
-# --------------------------------------------------------------------------------------------------
-function Get-FSLogixProfiles {
-    param(
-        [Parameter(Mandatory=$true)]
-        [string]$Root
-    )
+$isSim = $WhatIfPreference
+$mode  = if ($isSim) { 'WHATIF' } else { 'LIVE' }
 
-    Write-Host "Scanning for *.vhd* under $Root ..." -ForegroundColor Yellow
-
-    $vhdFiles = Get-ChildItem -Path $Root -Recurse -File -Filter *.vhd* -ErrorAction SilentlyContinue
-    Write-Host "Found $($vhdFiles.Count) container file(s)." -ForegroundColor Green
-
-    $userTable = @{}
-
-    foreach ($file in $vhdFiles) {
-        $folderLeaf = Split-Path $file.DirectoryName -Leaf
-        $userNameGuess = $null
-
-        # Pattern: username_S-1-5-21-...
-        if ($folderLeaf -match '^(?<user>.+?)_S-1-5-21-') {
-            $userNameGuess = $Matches['user']
-        }
-        elseif ($file.BaseName -match '^(?<user>.+?)_S-1-5-21-') {
-            $userNameGuess = $Matches['user']
-        }
-        else {
-            # Fallback: just use the folder name
-            $userNameGuess = $folderLeaf
-        }
-
-        if ([string]::IsNullOrWhiteSpace($userNameGuess)) { continue }
-
-        if (-not $userTable.ContainsKey($userNameGuess)) {
-            $userTable[$userNameGuess] = [PSCustomObject]@{
-                UserName       = $userNameGuess
-                ContainerCount = 0
-                ProfileSizeGB  = 0.0
-                OfficeSizeGB   = 0.0
-                TotalSizeGB    = 0.0
-                LastWriteTime  = $file.LastWriteTime
-                RootFolder     = $file.DirectoryName
-                ContainerFiles = @()
-            }
-        }
-
-        $entry = $userTable[$userNameGuess]
-
-        $entry.ContainerCount++
-        $entry.ContainerFiles += $file.FullName
-
-        $sizeGB = [Math]::Round($file.Length / 1GB, 3)
-
-        if ($file.Name -match 'odfc|office') {
-            $entry.OfficeSizeGB += $sizeGB
-        } else {
-            $entry.ProfileSizeGB += $sizeGB
-        }
-
-        $entry.TotalSizeGB = $entry.ProfileSizeGB + $entry.OfficeSizeGB
-
-        if ($file.LastWriteTime -gt $entry.LastWriteTime) {
-            $entry.LastWriteTime = $file.LastWriteTime
-        }
-
-        if (-not $entry.RootFolder) {
-            $entry.RootFolder = $file.DirectoryName
-        }
-    }
-
-    return $userTable.Values | Sort-Object UserName
-}
-
-# --------------------------------------------------------------------------------------------------
-#  Filtering helper
-# --------------------------------------------------------------------------------------------------
-function Apply-Filters {
-    param(
-        [System.Collections.IEnumerable]$Source,
-        [string[]]$UserFilter,
-        [int]$LastUsedDays
-    )
-
-    $filtered = $Source
-
-    if ($UserFilter -and $UserFilter.Count -gt 0) {
-        $patterns = $UserFilter
-        $filtered = $filtered | Where-Object {
-            $name = $_.UserName
-            foreach ($p in $patterns) {
-                if ($name -like $p) { return $true }
-            }
-            return $false
-        }
-    }
-
-    if ($LastUsedDays -gt 0) {
-        $threshold = (Get-Date).AddDays(-$LastUsedDays)
-        $filtered = $filtered | Where-Object {
-            $_.LastWriteTime -lt $threshold
-        }
-    }
-
-    return @($filtered)
-}
-
-# --------------------------------------------------------------------------------------------------
-#  Retire (rename) profiles with logging (+ Only ODFC / Only Profile)
-# --------------------------------------------------------------------------------------------------
-function Rename-FSLogixProfileObject {
-    param(
-        [Parameter(Mandatory=$true)]
-        $ProfileObject,
-        [bool]$WhatIfMode = $true,
-        [bool]$OnlyOdfcMode = $false,
-        [bool]$OnlyProfileMode = $false
-    )
-
-    $user  = $ProfileObject.UserName
-    $stamp = Get-Date -Format "yyyyMMddHHmmss"
-    $log   = Join-Path $env:TEMP ("FSLogix_Rename_{0}_{1}.log" -f $user, $stamp)
-
-    function LogLocal {
-        param($msg, $logFile)
-        $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-        "$ts $msg" | Tee-Object -FilePath $logFile -Append | Out-Null
-    }
-
-    LogLocal "Starting rename (retire) for '$user'" $log
-    LogLocal "Containers (all types): $($ProfileObject.ContainerFiles.Count)" $log
-    LogLocal "Mode: WhatIf=$WhatIfMode, OnlyODFC=$OnlyOdfcMode, OnlyProfile=$OnlyProfileMode" $log
-
-    $files = $ProfileObject.ContainerFiles
-
-    if ($OnlyOdfcMode -and $OnlyProfileMode) {
-        LogLocal "Both ODFC-only and Profile-only were selected. No action taken." $log
-        return $log
-    }
-
-    if ($OnlyOdfcMode) {
-        $files = $files | Where-Object { $_ -match 'odfc|office' }
-        LogLocal "Filtered to ODFC/Office containers: $($files.Count)" $log
-    }
-
-    if ($OnlyProfileMode) {
-        $files = $files | Where-Object { $_ -notmatch 'odfc|office' }
-        LogLocal "Filtered to Profile containers (non-ODFC): $($files.Count)" $log
-    }
-
-    if (-not $files -or $files.Count -eq 0) {
-        LogLocal "No files to rename with current mode. Exiting." $log
-        return $log
-    }
-
-    foreach ($path in $files) {
-        if (-not (Test-Path $path)) {
-            LogLocal "Missing file (skip): $path" $log
-            continue
-        }
-
-        $dir  = Split-Path -Parent $path
-        $name = Split-Path -Leaf  $path
-
-        $base = [System.IO.Path]::GetFileNameWithoutExtension($name)
-        $ext  = [System.IO.Path]::GetExtension($name)
-
-        $newName = "{0}-old{1}" -f $base, $ext
-        $newPath = Join-Path $dir $newName
-
-        if (Test-Path $newPath) {
-            LogLocal "Target already exists (skip): $newPath" $log
-            continue
-        }
-
-        if ($WhatIfMode) {
-            LogLocal "WHATIF: Would rename $path -> $newPath" $log
-        } else {
-            try {
-                Rename-Item -LiteralPath $path -NewName $newName -ErrorAction Stop
-                LogLocal ("Renamed {0} -> {1}" -f $path, $newPath) $log
-            } catch {
-                LogLocal ("ERROR renaming {0}: {1}" -f $path, $_.Exception.Message) $log
-            }
-        }
-    }
-
-    LogLocal "Completed rename (retire) for '$user'" $log
-    return $log
-}
-
-# --------------------------------------------------------------------------------------------------
-#  Main
-# --------------------------------------------------------------------------------------------------
-
-$allProfiles = Get-FSLogixProfiles -Root $ProfileRoot
-if (-not $allProfiles -or $allProfiles.Count -eq 0) {
-    Write-Warning "No FSLogix profiles discovered under $ProfileRoot."
-    exit 0
-}
-
-$targets = Apply-Filters -Source $allProfiles -UserFilter $User -LastUsedDays $LastUsedDays
-
-if ($targets.Count -eq 0) {
-    Write-Warning "No profiles matched the specified filters."
-    exit 0
-}
-
+Write-Host "FSLogixResetProfile.ps1 - v0.8.0" -ForegroundColor Cyan
+Write-Host ("ProfileRoot(s): {0}" -f ($roots -join '; '))
+Write-Host ("User filter  : {0}" -f ($User -join ', '))
+Write-Host ("LastUsedDays : {0}" -f $LastUsedDays)
+Write-Host ("All          : {0}" -f $All.IsPresent)
+Write-Host ("Scope        : {0}" -f $Scope)
+Write-Host ("CheckInUse   : {0}" -f ([bool]$CheckInUse))
+Write-Host ("WhatIf       : {0}" -f $isSim)
 Write-Host ""
-Write-Host "Matched $($targets.Count) user profile(s) with current filters:" -ForegroundColor Yellow
-$targets | Select-Object UserName, ContainerCount, TotalSizeGB, LastWriteTime |
-    Format-Table -AutoSize
+
+# --------------------------------------------------------------------------------------------------
+#  Scan + filter
+# --------------------------------------------------------------------------------------------------
+$profiles = @(Get-FSLogixProfiles -ProfileRoots $roots)
+
+# Direct call (not @( ... )) so the module's leading-comma return unwraps
+# cleanly. Wrapping with @() would give a 1-element array containing the
+# real result, which makes .Count always 1 for empty results.
+$filtered = Select-FSLogixProfile -Source $profiles -UserFilter $User -AgeDays $LastUsedDays
+
+if ($null -eq $filtered -or $filtered.Count -eq 0) {
+    Write-Output "No profiles matched the filters."
+    exit 0
+}
+
+Write-Output ("Matched {0} user profile(s):" -f $filtered.Count)
+$filtered |
+    Select-Object UserName, ContainerCount, TotalSizeGB, LastWriteTime, ADStatus, HealthIssues |
+    Format-Table -AutoSize | Out-String | Write-Output
 
 if ($ListOnly) {
-    Write-Host ""
-    Write-Host "ListOnly mode: no reset performed." -ForegroundColor Cyan
+    Write-Host "ListOnly: no changes made." -ForegroundColor Cyan
     exit 0
 }
 
-$modeText = if ($OnlyOdfc) {
-    "ODFC/Office containers only"
-} elseif ($OnlyProfile) {
-    "Profile containers only"
-} else {
-    "ALL containers (Profile + Office)"
+# --------------------------------------------------------------------------------------------------
+#  Per-batch confirmation (only for live runs; WhatIf never prompts)
+# --------------------------------------------------------------------------------------------------
+if (-not $isSim -and $ConfirmPreference -ne 'None') {
+    $names = @($filtered | ForEach-Object { $_.UserName } | Sort-Object)
+    $displayNames = if ($names.Count -le 5) { $names -join ', ' } else {
+        ($names[0..4] -join ', ') + " (+$($names.Count - 5) more)"
+    }
+    $message = "Retire profiles for:`n$displayNames`n`nScope: $Scope`nIn-use check: $CheckInUse`n`nProceed?"
+    $yes = New-Object System.Management.Automation.Host.ChoiceDescription '&Yes', 'Perform the rename.'
+    $no  = New-Object System.Management.Automation.Host.ChoiceDescription '&No',  'Cancel without changes.'
+    $options = [System.Management.Automation.Host.ChoiceDescription[]]($yes, $no)
+    $choice = $host.UI.PromptForChoice("Confirm - $mode", $message, $options, 1)  # 1 = default No
+    if ($choice -ne 0) {
+        Write-Host "Cancelled." -ForegroundColor Yellow
+        exit 0
+    }
 }
 
-Write-Host ""
-Write-Host "Reset mode : $modeText" -ForegroundColor Yellow
-Write-Host "WhatIf     : $($WhatIf.IsPresent)" -ForegroundColor Yellow
-Write-Host ""
+# --------------------------------------------------------------------------------------------------
+#  Execute
+# --------------------------------------------------------------------------------------------------
+$results = @()
+foreach ($profile in $filtered) {
+    if (-not $PSCmdlet.ShouldProcess($profile.UserName, "Retire (scope=$Scope, checkInUse=$([bool]$CheckInUse))")) {
+        continue
+    }
+    $r = Rename-FSLogixProfileObject `
+        -ProfileObject $profile `
+        -Scope $Scope `
+        -CheckInUse:$CheckInUse `
+        -Force:$Force `
+        -Confirm:$false
+    $results += $r
+}
 
-$logs = @()
-
-foreach ($p in $targets) {
-    Write-Host ("Processing user: {0}" -f $p.UserName) -ForegroundColor Cyan
-    $logFile = Rename-FSLogixProfileObject `
-        -ProfileObject $p `
-        -WhatIfMode:$WhatIf.IsPresent `
-        -OnlyOdfcMode:$OnlyOdfc.IsPresent `
-        -OnlyProfileMode:$OnlyProfile.IsPresent
-
-    if ($logFile) {
-        $logs += $logFile
+# --------------------------------------------------------------------------------------------------
+#  Report
+# --------------------------------------------------------------------------------------------------
+$totals = [PSCustomObject]@{
+    Planned       = 0
+    Renamed       = 0
+    SkippedInUse  = 0
+    SkippedExists = 0
+    Missing       = 0
+    Failed        = 0
+    AbortedCount  = 0
+    AbortReasons  = @()
+}
+foreach ($r in $results) {
+    $totals.Planned       += $r.Planned
+    $totals.Renamed       += $r.Renamed
+    $totals.SkippedInUse  += $r.SkippedInUse
+    $totals.SkippedExists += $r.SkippedExists
+    $totals.Missing       += $r.Missing
+    $totals.Failed        += $r.Failed
+    if ($r.Aborted) {
+        $totals.AbortedCount++
+        $totals.AbortReasons += "$($r.UserName): $($r.AbortReason)"
     }
 }
 
 Write-Host ""
-Write-Host "Done. Log files:" -ForegroundColor Green
-$logs | ForEach-Object { Write-Host "  $_" }
-Write-Host ""
-Write-Host "Tip: review logs first when running with -WhatIf. Remove -WhatIf to actually reset." -ForegroundColor DarkCyan
+Write-Output "[$mode] Summary"
+Write-Output ("  Planned:           {0}" -f $totals.Planned)
+Write-Output ("  Renamed:           {0}" -f $totals.Renamed)
+Write-Output ("  Skipped (in-use):  {0}" -f $totals.SkippedInUse)
+Write-Output ("  Skipped (exists):  {0}" -f $totals.SkippedExists)
+Write-Output ("  Missing:           {0}" -f $totals.Missing)
+Write-Output ("  Failed:            {0}" -f $totals.Failed)
+if ($totals.AbortedCount -gt 0) {
+    Write-Host ""
+    Write-Output "Aborted:"
+    foreach ($reason in $totals.AbortReasons) { Write-Output "  $reason" }
+}
+
+exit 0

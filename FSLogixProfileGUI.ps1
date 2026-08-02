@@ -1213,7 +1213,11 @@ function On-ScanComplete {
     } else {
         $script:AllProfiles = @($script:ScanState.Result)
         $ageDays = if ($chkAge.Checked) { [int]$numAge.Value } else { 0 }
-        $filtered = @(Select-FSLogixProfile -Source $script:AllProfiles -UserFilter @(,$txtFilter.Text) -AgeDays $ageDays -OnlyIssues:$chkOnlyIssues.Checked)
+        # Direct call (not @( ... )) so the module's leading-comma return unwraps
+        # cleanly. Wrapping would give a 1-element array containing the real
+        # result, which makes .Count always 1 for empty results.
+        $filtered = Select-FSLogixProfile -Source $script:AllProfiles -UserFilter @(,$txtFilter.Text) -AgeDays $ageDays -OnlyIssues:$chkOnlyIssues.Checked
+        if ($null -eq $filtered) { $filtered = @() }
         Show-ProfilesInGrid $filtered
         $issueCount = @($script:AllProfiles | Where-Object { $_.HealthIssues.Count -gt 0 }).Count
         $script:lblStatus.Text = "Loaded $($filtered.Count) user(s) from $($script:ScanState.Roots.Count) root(s). Issues: $issueCount"
@@ -1253,7 +1257,8 @@ $btnApplyFilter.Add_Click({
     if (-not $script:AllProfiles -or $script:AllProfiles.Count -eq 0) { return }
 
     $ageDays = if ($chkAge.Checked) { [int]$numAge.Value } else { 0 }
-    $filtered = @(Select-FSLogixProfile -Source $script:AllProfiles -UserFilter @(,$txtFilter.Text) -AgeDays $ageDays -OnlyIssues:$chkOnlyIssues.Checked)
+    $filtered = Select-FSLogixProfile -Source $script:AllProfiles -UserFilter @(,$txtFilter.Text) -AgeDays $ageDays -OnlyIssues:$chkOnlyIssues.Checked
+    if ($null -eq $filtered) { $filtered = @() }
 
     Show-ProfilesInGrid $filtered
     $script:lblStatus.Text = "Filter: $($filtered.Count) user(s)"
