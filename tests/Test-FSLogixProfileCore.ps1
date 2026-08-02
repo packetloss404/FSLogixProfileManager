@@ -86,6 +86,26 @@ Check 'ret.count'   $ret.Count 1
 Check 'ret.datesrc' $ret[0].DateSource 'stamp'
 Check 'ret.sibling' $ret[0].HasLiveSibling 'True'
 
+Write-Host "-- rename under WhatIf --"
+# The handoff's "obvious next test": retire under -WhatIf against the synthetic
+# share. Must report zero renames, must not touch the file, and must return the
+# same structured shape the GUI now renders into the result dialog.
+$root2 = Join-Path $env:TEMP ('fsl_' + (Get-Random))
+$dave  = Join-Path $root2 'S-1-5-21-9-9-9-2_dave'
+New-Item -ItemType Directory -Path $dave -Force | Out-Null
+Mk (Join-Path $dave 'Profile_dave.vhdx') 2048
+$profiles = @(Get-FSLogixProfiles -ProfileRoots @($root2))
+$daveRow  = $profiles | Where-Object { $_.UserName -eq 'dave' }
+$result   = Rename-FSLogixProfileObject -ProfileObject $daveRow -Scope 'All' -WhatIf -Confirm:$false
+Check 'wi.mode'     $result.Mode        'WHATIF'
+Check 'wi.renamed'  $result.Renamed     0
+Check 'wi.planned'  $result.Planned     1
+# The container on disk is still the live one - no rename happened.
+Check 'wi.untouched' (Test-Path -LiteralPath (Join-Path $dave 'Profile_dave.vhdx')) 'True'
+# Module returns a log path even in WhatIf.
+Check 'wi.logpath'   ([bool]$result.LogPath) 'True'
+Remove-Item $root2 -Recurse -Force
+
 Remove-Item $root,$solo -Recurse -Force
 Write-Host ""
 if($fail){Write-Host "$fail CHECK(S) FAILED" -ForegroundColor Red; exit 1}else{Write-Host "ALL CHECKS PASSED" -ForegroundColor Green}

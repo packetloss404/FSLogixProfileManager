@@ -1,6 +1,6 @@
 <#
 FSLogix Profile Manager - Horizon Instant Clones
-Version: 0.7.0
+Version: 0.8.0
 
 Environment:
   Root: \\fml-fslogix\FSLogixUserProfiles (supports multiple paths separated by semicolon)
@@ -8,21 +8,70 @@ Environment:
 
 This tool:
   - Finds all *.vhd / *.vhdx under the root(s)
-  - Derives username from the folder name (before "_S-1-5-21-")
+  - Derives username + SID from the folder or filename (both FlipFlop orders + NoProfileContainingFolder)
   - Shows one row per user (aggregated across SIDs) with SID breakdown
   - Detects corrupt profiles, orphaned users (not in AD), and disk space issues
-  - Lets you filter, highlight big profiles, and retire containers (with WhatIf).
+  - Lets you filter, highlight big profiles, and retire containers (with WhatIf by default).
   - Supports multiple profile roots (Cloud Cache), CSV export, column sorting, and theming.
+
+All scan/filter/retire/restore logic lives in FSLogixProfileCore.psm1; this script
+is the WinForms host.
 #>
 
 param(
     [string]$DefaultProfileRoot = "\\fml-fslogix\FSLogixUserProfiles"
 )
 
-$appVersion = "0.7.0"
+$appVersion = "0.8.0"
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
+
+# --------------------------------------------------------------------
+#  Logging helper for embedded log panel (defined first; module hooks in below)
+# --------------------------------------------------------------------
+function Add-LogMessage {
+    param([string]$Message, [string]$Level = "INFO")
+    $ts = Get-Date -Format "HH:mm:ss"
+    $entry = "[$ts] [$Level] $Message"
+    [void]$script:LogMessages.Add($entry)
+
+    while ($script:LogMessages.Count -gt 500) {
+        $script:LogMessages.RemoveAt(0)
+    }
+
+    if ($script:txtLog -and $script:txtLog.IsHandleCreated) {
+        try {
+            $script:txtLog.Invoke([Action]{
+                $script:txtLog.AppendText("$entry`r`n")
+                $script:txtLog.SelectionStart = $script:txtLog.TextLength
+                $script:txtLog.ScrollToCaret()
+            })
+        } catch {
+            # Ignore invoke errors during form construction
+        }
+    }
+}
+
+# --------------------------------------------------------------------
+#  Load shared core module and route its log output into this GUI
+# --------------------------------------------------------------------
+$script:ModulePath = Join-Path $PSScriptRoot 'FSLogixProfileCore.psm1'
+Import-Module $script:ModulePath -Force
+
+$script:LogHandler = {
+    param($Message, $Level)
+    # PROGRESS is for a status bar, not a log buffer.
+    if ($Level -eq 'PROGRESS') {
+        $lbl = $script:lblStatus
+        if ($lbl -and $lbl.IsHandleCreated) {
+            try { $lbl.Invoke([Action]{ $script:lblStatus.Text = $Message }) } catch { }
+        }
+        return
+    }
+    Add-LogMessage $Message $Level
+}
+Set-FSLogixLogHandler $script:LogHandler
 
 # --------------------------------------------------------------------
 #  Theme definitions
@@ -43,6 +92,10 @@ $script:Themes = @{
         TextBoxForeColor = [System.Drawing.Color]::Black
         LogPanelBackColor = [System.Drawing.Color]::FromArgb(250, 250, 250)
         LogPanelForeColor = [System.Drawing.Color]::Black
+        HealthCorrupt   = [System.Drawing.Color]::LightCoral
+        HealthOrphan    = [System.Drawing.Color]::LightGoldenrodYellow
+        HealthNearLimit = [System.Drawing.Color]::PeachPuff
+        LiveButtonColor = [System.Drawing.Color]::FromArgb(192, 40, 40)
     }
     Dark = @{
         FormBackColor = [System.Drawing.Color]::FromArgb(45, 45, 48)
@@ -59,489 +112,15 @@ $script:Themes = @{
         TextBoxForeColor = [System.Drawing.Color]::FromArgb(220, 220, 220)
         LogPanelBackColor = [System.Drawing.Color]::FromArgb(30, 30, 30)
         LogPanelForeColor = [System.Drawing.Color]::FromArgb(180, 180, 180)
+        HealthCorrupt   = [System.Drawing.Color]::FromArgb(140, 50, 50)
+        HealthOrphan    = [System.Drawing.Color]::FromArgb(120, 100, 30)
+        HealthNearLimit = [System.Drawing.Color]::FromArgb(120, 80, 40)
+        LiveButtonColor = [System.Drawing.Color]::FromArgb(180, 50, 50)
     }
 }
 
 $script:CurrentTheme = "Light"
 $script:LogMessages = [System.Collections.ArrayList]::new()
-
-# Common VHD size limits (in GB) - FSLogix defaults
-$script:CommonSizeLimits = @(30, 50, 100, 120)
-$script:SizeWarningThresholdPercent = 90
-
-# --------------------------------------------------------------------
-#  Logging helper for embedded log panel
-# --------------------------------------------------------------------
-function Add-LogMessage {
-    param([string]$Message, [string]$Level = "INFO")
-    $ts = Get-Date -Format "HH:mm:ss"
-    $entry = "[$ts] [$Level] $Message"
-    [void]$script:LogMessages.Add($entry)
-
-    # Keep only last 500 messages
-    while ($script:LogMessages.Count -gt 500) {
-        $script:LogMessages.RemoveAt(0)
-    }
-
-    # Update log panel if it exists
-    if ($script:txtLog -and $script:txtLog.IsHandleCreated) {
-        try {
-            $script:txtLog.Invoke([Action]{
-                $script:txtLog.AppendText("$entry`r`n")
-                $script:txtLog.SelectionStart = $script:txtLog.TextLength
-                $script:txtLog.ScrollToCaret()
-            })
-        } catch {
-            # Ignore invoke errors during form construction
-        }
-    }
-}
-
-# --------------------------------------------------------------------
-#  Open handle detection using file system
-# --------------------------------------------------------------------
-function Test-FileInUse {
-    param([string]$FilePath)
-
-    if (-not (Test-Path $FilePath)) {
-        return $false
-    }
-
-    try {
-        $stream = [System.IO.File]::Open($FilePath, 'Open', 'ReadWrite', 'None')
-        $stream.Close()
-        $stream.Dispose()
-        return $false
-    } catch {
-        return $true
-    }
-}
-
-function Get-InUseContainers {
-    param($ProfileObject)
-
-    $inUse = @()
-    foreach ($file in $ProfileObject.ContainerFiles) {
-        if (Test-FileInUse -FilePath $file) {
-            $inUse += $file
-        }
-    }
-    return $inUse
-}
-
-# --------------------------------------------------------------------
-#  AD Orphan Detection
-# --------------------------------------------------------------------
-function Test-UserExistsInAD {
-    param([string]$UserName)
-
-    # Try multiple methods to check if user exists
-    try {
-        # Method 1: Try ADSI searcher (works without AD module)
-        $searcher = [adsisearcher]"(samaccountname=$UserName)"
-        $result = $searcher.FindOne()
-        return ($null -ne $result)
-    } catch {
-        # ADSI failed, try AD module if available
-        try {
-            if (Get-Command Get-ADUser -ErrorAction SilentlyContinue) {
-                $user = Get-ADUser -Identity $UserName -ErrorAction SilentlyContinue
-                return ($null -ne $user)
-            }
-        } catch {
-            # AD module query failed
-        }
-    }
-
-    # If we can't query AD, assume user exists (don't mark as orphan)
-    return $true
-}
-
-$script:ADCheckEnabled = $false
-$script:ADCheckCache = @{}
-
-function Initialize-ADCheck {
-    # Test if we can query AD
-    try {
-        $searcher = [adsisearcher]"(samaccountname=Administrator)"
-        $result = $searcher.FindOne()
-        $script:ADCheckEnabled = $true
-        Add-LogMessage "AD connectivity verified - orphan detection enabled" "INFO"
-        return $true
-    } catch {
-        $script:ADCheckEnabled = $false
-        Add-LogMessage "AD not available - orphan detection disabled" "WARN"
-        return $false
-    }
-}
-
-function Get-UserADStatus {
-    param([string]$UserName)
-
-    if (-not $script:ADCheckEnabled) {
-        return "UNKNOWN"
-    }
-
-    # Check cache first
-    if ($script:ADCheckCache.ContainsKey($UserName)) {
-        return $script:ADCheckCache[$UserName]
-    }
-
-    # Query AD
-    $exists = Test-UserExistsInAD -UserName $UserName
-    $status = if ($exists) { "OK" } else { "ORPHAN" }
-    $script:ADCheckCache[$UserName] = $status
-
-    return $status
-}
-
-# --------------------------------------------------------------------
-#  VHD Health Check
-# --------------------------------------------------------------------
-function Get-VHDHealth {
-    param(
-        [string]$FilePath,
-        [double]$FileSizeGB
-    )
-
-    $issues = @()
-
-    # Check for CORRUPT in filename
-    $fileName = Split-Path -Leaf $FilePath
-    if ($fileName -match 'CORRUPT') {
-        $issues += "CORRUPT"
-    }
-
-    # Check for -old (already retired)
-    if ($fileName -match '-old\.vhdx?$') {
-        $issues += "RETIRED"
-    }
-
-    # Check if file size is near common limits
-    foreach ($limit in $script:CommonSizeLimits) {
-        $threshold = $limit * ($script:SizeWarningThresholdPercent / 100)
-        if ($FileSizeGB -ge $threshold -and $FileSizeGB -le $limit) {
-            $issues += "NEAR_LIMIT"
-            break
-        }
-    }
-
-    # Check if file is very small (might be corrupt/empty)
-    if ($FileSizeGB -lt 0.001 -and (Test-Path $FilePath)) {
-        $issues += "EMPTY"
-    }
-
-    if ($issues.Count -eq 0) {
-        return "OK"
-    }
-
-    return ($issues -join ",")
-}
-
-function Get-VHDMaxSize {
-    param([string]$FilePath)
-
-    # Try to get max size using Get-VHD if Hyper-V module is available
-    try {
-        if (Get-Command Get-VHD -ErrorAction SilentlyContinue) {
-            $vhd = Get-VHD -Path $FilePath -ErrorAction SilentlyContinue
-            if ($vhd) {
-                return [Math]::Round($vhd.Size / 1GB, 2)
-            }
-        }
-    } catch {
-        # Get-VHD not available or failed
-    }
-
-    # Fallback: guess based on common limits
-    $fileSizeGB = (Get-Item $FilePath -ErrorAction SilentlyContinue).Length / 1GB
-    foreach ($limit in ($script:CommonSizeLimits | Sort-Object)) {
-        if ($fileSizeGB -lt $limit) {
-            return $limit
-        }
-    }
-
-    return 30  # Default FSLogix limit
-}
-
-# --------------------------------------------------------------------
-#  FSLogix scan + username detection (with SID tracking + health)
-# --------------------------------------------------------------------
-function Get-FSLogixProfiles {
-    param(
-        [Parameter(Mandatory=$true)]
-        [string[]]$ProfileRoots,
-        [bool]$CheckOrphans = $false
-    )
-
-    $userTable = @{}
-
-    # Initialize AD check if orphan detection requested
-    if ($CheckOrphans) {
-        Initialize-ADCheck
-    }
-
-    foreach ($ProfileRoot in $ProfileRoots) {
-        $ProfileRoot = $ProfileRoot.Trim()
-        if ([string]::IsNullOrWhiteSpace($ProfileRoot)) { continue }
-
-        if (-not (Test-Path $ProfileRoot)) {
-            Add-LogMessage "Profile root not found: $ProfileRoot" "WARN"
-            continue
-        }
-
-        Add-LogMessage "Scanning: $ProfileRoot" "INFO"
-
-        # All container files
-        $vhdFiles = Get-ChildItem -Path $ProfileRoot -Recurse -File -Filter *.vhd* -ErrorAction SilentlyContinue
-        Add-LogMessage "Found $($vhdFiles.Count) .vhd/.vhdx files under $ProfileRoot" "INFO"
-
-        foreach ($file in $vhdFiles) {
-            # Folder that contains the SID, e.g. vditest1_S-1-5-21-1602...
-            $folderLeaf = Split-Path $file.DirectoryName -Leaf
-            $userNameGuess = $null
-            $sidMatch = $null
-
-            # Pattern: username_S-1-5-21-...
-            if ($folderLeaf -match '^(?<user>.+?)_(?<sid>S-1-5-21-[\d-]+)') {
-                $userNameGuess = $Matches['user']
-                $sidMatch = $Matches['sid']
-            }
-            elseif ($file.BaseName -match '^(?<user>.+?)_(?<sid>S-1-5-21-[\d-]+)') {
-                $userNameGuess = $Matches['user']
-                $sidMatch = $Matches['sid']
-            }
-            else {
-                # Fallback: just use the folder name as-is
-                $userNameGuess = $folderLeaf
-                $sidMatch = "Unknown"
-            }
-
-            if ([string]::IsNullOrWhiteSpace($userNameGuess)) {
-                continue
-            }
-
-            $fileSizeGB = [Math]::Round($file.Length / 1GB, 3)
-
-            if (-not $userTable.ContainsKey($userNameGuess)) {
-                $userTable[$userNameGuess] = [PSCustomObject]@{
-                    UserName       = $userNameGuess
-                    ContainerCount = 0
-                    ProfileSizeGB  = 0.0
-                    OfficeSizeGB   = 0.0
-                    TotalSizeGB    = 0.0
-                    MaxSizeGB      = 0.0
-                    LastWriteTime  = $file.LastWriteTime
-                    RootFolder     = $file.DirectoryName
-                    ContainerFiles = @()
-                    SIDs           = [System.Collections.Generic.HashSet[string]]::new()
-                    ProfileRoots   = [System.Collections.Generic.HashSet[string]]::new()
-                    HealthIssues   = [System.Collections.Generic.HashSet[string]]::new()
-                    ADStatus       = "UNKNOWN"
-                }
-            }
-
-            $entry = $userTable[$userNameGuess]
-
-            $entry.ContainerCount++
-            $entry.ContainerFiles += $file.FullName
-
-            # Track SIDs
-            if ($sidMatch) {
-                [void]$entry.SIDs.Add($sidMatch)
-            }
-
-            # Track which roots this user appears in
-            [void]$entry.ProfileRoots.Add($ProfileRoot)
-
-            # Check VHD health
-            $health = Get-VHDHealth -FilePath $file.FullName -FileSizeGB $fileSizeGB
-            if ($health -ne "OK") {
-                foreach ($issue in ($health -split ',')) {
-                    [void]$entry.HealthIssues.Add($issue)
-                }
-            }
-
-            # Track max size (use largest container's limit)
-            $maxSize = Get-VHDMaxSize -FilePath $file.FullName
-            if ($maxSize -gt $entry.MaxSizeGB) {
-                $entry.MaxSizeGB = $maxSize
-            }
-
-            # Simple classification: Office vs Profile by filename
-            if ($file.Name -match 'odfc|office') {
-                $entry.OfficeSizeGB += $fileSizeGB
-            } else {
-                $entry.ProfileSizeGB += $fileSizeGB
-            }
-
-            $entry.TotalSizeGB = $entry.ProfileSizeGB + $entry.OfficeSizeGB
-
-            if ($file.LastWriteTime -gt $entry.LastWriteTime) {
-                $entry.LastWriteTime = $file.LastWriteTime
-            }
-
-            # RootFolder: keep the "highest" folder we see (first one)
-            if (-not $entry.RootFolder) {
-                $entry.RootFolder = $file.DirectoryName
-            }
-        }
-    }
-
-    # Check AD status for each user if enabled
-    if ($CheckOrphans -and $script:ADCheckEnabled) {
-        Add-LogMessage "Checking AD status for $($userTable.Count) users..." "INFO"
-        $orphanCount = 0
-        foreach ($user in $userTable.Keys) {
-            $status = Get-UserADStatus -UserName $user
-            $userTable[$user].ADStatus = $status
-            if ($status -eq "ORPHAN") {
-                [void]$userTable[$user].HealthIssues.Add("ORPHAN")
-                $orphanCount++
-            }
-        }
-        Add-LogMessage "Found $orphanCount orphaned profiles" "INFO"
-    }
-
-    Add-LogMessage "Total unique users found: $($userTable.Count)" "INFO"
-    return $userTable.Values | Sort-Object UserName
-}
-
-# --------------------------------------------------------------------
-#  Retire (rename) profiles with logging (+ Only ODFC / Only Profile)
-# --------------------------------------------------------------------
-function Rename-FSLogixProfileObject {
-    param(
-        [Parameter(Mandatory=$true)]
-        $ProfileObject,
-        [bool]$WhatIf = $true,
-        [bool]$OnlyOdfc = $false,
-        [bool]$OnlyProfile = $false,
-        [bool]$CheckInUse = $true
-    )
-
-    $user = $ProfileObject.UserName
-    $stamp = Get-Date -Format "yyyyMMddHHmmss"
-    $log = Join-Path $env:TEMP ("FSLogix_Rename_{0}_{1}.log" -f $user, $stamp)
-
-    function LogLocal {
-        param($msg, $logFile)
-        $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-        "$ts $msg" | Tee-Object -FilePath $logFile -Append | Out-Null
-        Add-LogMessage $msg "INFO"
-    }
-
-    LogLocal "Starting rename (retire) for '$user'" $log
-    LogLocal "Containers (all types): $($ProfileObject.ContainerFiles.Count)" $log
-    LogLocal "Mode: WhatIf=$WhatIf, OnlyODFC=$OnlyOdfc, OnlyProfile=$OnlyProfile, CheckInUse=$CheckInUse" $log
-
-    # Decide which files to target
-    $files = $ProfileObject.ContainerFiles
-
-    if ($OnlyOdfc -and $OnlyProfile) {
-        LogLocal "Both ODFC-only and Profile-only were selected. No action taken." $log
-        return $log
-    }
-
-    if ($OnlyOdfc) {
-        $files = $files | Where-Object { $_ -match 'odfc|office' }
-        LogLocal "Filtered to ODFC/Office containers: $($files.Count)" $log
-    }
-
-    if ($OnlyProfile) {
-        $files = $files | Where-Object { $_ -notmatch 'odfc|office' }
-        LogLocal "Filtered to Profile containers (non-ODFC): $($files.Count)" $log
-    }
-
-    if (-not $files -or $files.Count -eq 0) {
-        LogLocal "No files to rename with current mode. Exiting." $log
-        return $log
-    }
-
-    $skippedInUse = @()
-
-    foreach ($path in $files) {
-        if (-not (Test-Path $path)) {
-            LogLocal "Missing file (skip): $path" $log
-            continue
-        }
-
-        # Check if file is in use
-        if ($CheckInUse -and (Test-FileInUse -FilePath $path)) {
-            LogLocal "IN USE (skip): $path" $log
-            $skippedInUse += $path
-            continue
-        }
-
-        $dir  = Split-Path -Parent $path
-        $name = Split-Path -Leaf  $path
-
-        $base = [System.IO.Path]::GetFileNameWithoutExtension($name)
-        $ext  = [System.IO.Path]::GetExtension($name)
-
-        $newName = "{0}-old{1}" -f $base, $ext
-        $newPath = Join-Path $dir $newName
-
-        if (Test-Path $newPath) {
-            LogLocal "Target already exists (skip): $newPath" $log
-            continue
-        }
-
-        if ($WhatIf) {
-            LogLocal "WHATIF: Would rename $path -> $newPath" $log
-        } else {
-            try {
-                Rename-Item -LiteralPath $path -NewName $newName -ErrorAction Stop
-                LogLocal ("Renamed {0} -> {1}" -f $path, $newPath) $log
-            } catch {
-                LogLocal ("ERROR renaming {0}: {1}" -f $path, $_.Exception.Message) $log
-            }
-        }
-    }
-
-    if ($skippedInUse.Count -gt 0) {
-        LogLocal "Skipped $($skippedInUse.Count) in-use files" $log
-    }
-
-    LogLocal "Completed rename (retire) for '$user'" $log
-    return $log
-}
-
-# --------------------------------------------------------------------
-#  Filtering helper (returns filtered list)
-# --------------------------------------------------------------------
-function Apply-Filters {
-    param(
-        [System.Collections.IEnumerable]$Source,
-        [string]$UserFilter,
-        [bool]$UseAge,
-        [int]$AgeDays,
-        [bool]$OnlyIssues = $false
-    )
-
-    $filtered = $Source
-
-    if (-not [string]::IsNullOrWhiteSpace($UserFilter)) {
-        $filtered = $filtered | Where-Object {
-            $_.UserName -like "*$UserFilter*"
-        }
-    }
-
-    if ($UseAge -and $AgeDays -gt 0) {
-        $threshold = (Get-Date).AddDays(-$AgeDays)
-        $filtered = $filtered | Where-Object {
-            $_.LastWriteTime -lt $threshold
-        }
-    }
-
-    if ($OnlyIssues) {
-        $filtered = $filtered | Where-Object {
-            $_.HealthIssues.Count -gt 0
-        }
-    }
-
-    return @($filtered)
-}
 
 # --------------------------------------------------------------------
 #  Row highlight helper
@@ -561,18 +140,20 @@ function Update-RowHighlight {
         return
     }
 
+    $theme = $script:Themes[$script:CurrentTheme]
+
     # Priority: Health issues > Size highlight
     if ($ProfileObject.HealthIssues.Count -gt 0) {
-        if ($ProfileObject.HealthIssues -contains "CORRUPT") {
-            $Row.DefaultCellStyle.BackColor = [System.Drawing.Color]::LightCoral
+        if ($ProfileObject.HealthIssues -contains "CORRUPT" -or $ProfileObject.HealthIssues -contains "BAD_SIGNATURE") {
+            $Row.DefaultCellStyle.BackColor = $theme.HealthCorrupt
             return
         }
-        if ($ProfileObject.HealthIssues -contains "ORPHAN") {
-            $Row.DefaultCellStyle.BackColor = [System.Drawing.Color]::LightGoldenrodYellow
+        if ($ProfileObject.HealthIssues -contains "ORPHAN" -or $ProfileObject.HealthIssues -contains "AD_DISABLED") {
+            $Row.DefaultCellStyle.BackColor = $theme.HealthOrphan
             return
         }
-        if ($ProfileObject.HealthIssues -contains "NEAR_LIMIT") {
-            $Row.DefaultCellStyle.BackColor = [System.Drawing.Color]::PeachPuff
+        if ($ProfileObject.HealthIssues -contains "NEAR_LIMIT" -or $ProfileObject.HealthIssues -contains "OVER_LIMIT") {
+            $Row.DefaultCellStyle.BackColor = $theme.HealthNearLimit
             return
         }
     }
@@ -582,10 +163,7 @@ function Update-RowHighlight {
         return
     }
 
-    $size = 0.0
-    [void][double]::TryParse($ProfileObject.TotalSizeGB.ToString(), [ref]$size)
-
-    if ($size -ge $ThresholdGB) {
+    if ($ProfileObject.TotalSizeGB -ge $ThresholdGB) {
         $Row.DefaultCellStyle.BackColor = $HighlightColor
     } else {
         $Row.DefaultCellStyle.BackColor = $DefaultColor
@@ -603,26 +181,129 @@ function Export-GridToCSV {
 
     $sb = [System.Text.StringBuilder]::new()
 
-    # Headers
     $headers = @()
     foreach ($col in $Grid.Columns) {
         $headers += "`"$($col.HeaderText)`""
     }
     [void]$sb.AppendLine(($headers -join ","))
 
-    # Data rows
     foreach ($row in $Grid.Rows) {
         $values = @()
         foreach ($cell in $row.Cells) {
-            $val = if ($cell.Value) { $cell.Value.ToString() } else { "" }
+            # 0 / $false / $null are real data; only empty string is "no data".
+            $val = if ($null -ne $cell.Value) { $cell.Value.ToString() } else { "" }
             $val = $val -replace "`"", "`"`""
             $values += "`"$val`""
         }
         [void]$sb.AppendLine(($values -join ","))
     }
 
-    $sb.ToString() | Out-File -FilePath $FilePath -Encoding UTF8
+    [System.IO.File]::WriteAllText($FilePath, $sb.ToString(), [System.Text.Encoding]::UTF8)
     Add-LogMessage "Exported $($Grid.Rows.Count) rows to $FilePath" "INFO"
+}
+
+# --------------------------------------------------------------------
+#  Proportionate confirmation dialog
+# --------------------------------------------------------------------
+# Name up to ~5 users + "+N more", show the container count, default to Cancel,
+# and require the operator to type the container count when above a threshold.
+function Show-ResetConfirmation {
+    param(
+        $SelectedProfiles,
+        [int]$ContainerCount,
+        [bool]$WhatIf,
+        [ValidateSet('All', 'Office', 'Profile')][string]$Scope = 'All',
+        [int]$UserThreshold = 5,
+        [int]$ContainerThreshold = 20
+    )
+
+    $names = @($SelectedProfiles | ForEach-Object { $_.UserName } | Sort-Object)
+    $displayNames = if ($names.Count -le $UserThreshold) {
+        $names -join ', '
+    } else {
+        ($names[0..($UserThreshold - 1)] -join ', ') + " (+$($names.Count - $UserThreshold) more)"
+    }
+
+    $modeText = switch ($Scope) {
+        'Office'  { 'ODFC/Office containers only' }
+        'Profile' { 'Profile containers only' }
+        default   { 'ALL containers (Profile + Office)' }
+    }
+
+    $large = ($SelectedProfiles.Count -gt $UserThreshold) -or ($ContainerCount -gt $ContainerThreshold)
+
+    if (-not $large) {
+        $summary = "Users: $displayNames`n`nContainers: $ContainerCount`nMode: $modeText`nWhatIf: $WhatIf"
+        $resp = [System.Windows.Forms.MessageBox]::Show(
+            $summary + "`n`nProceed?",
+            "Confirm Reset - $(if ($WhatIf) {'SIMULATION'} else {'LIVE'})",
+            [System.Windows.Forms.MessageBoxButtons]::YesNo,
+            [System.Windows.Forms.MessageBoxIcon]::Warning,
+            [System.Windows.Forms.DialogResult]::No
+        )
+        return ($resp -eq [System.Windows.Forms.DialogResult]::Yes)
+    }
+
+    # Above threshold: require typed count.
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = "Confirm Reset - $(if ($WhatIf) {'SIMULATION'} else {'LIVE'})"
+    $form.Size = New-Object System.Drawing.Size(540, 360)
+    $form.StartPosition = "CenterParent"
+    $form.FormBorderStyle = "FixedDialog"
+    $form.MinimizeBox = $false
+    $form.MaximizeBox = $false
+
+    $lblSummary = New-Object System.Windows.Forms.Label
+    $lblSummary.Text = "Users: $displayNames`n`nContainers: $ContainerCount`nMode: $modeText`nWhatIf: $WhatIf"
+    $lblSummary.Location = New-Object System.Drawing.Point(12, 12)
+    $lblSummary.Size = New-Object System.Drawing.Size(510, 130)
+    $lblSummary.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+    $form.Controls.Add($lblSummary)
+
+    $lblPrompt = New-Object System.Windows.Forms.Label
+    $lblPrompt.Text = "Type the container count ($ContainerCount) to confirm:"
+    $lblPrompt.Location = New-Object System.Drawing.Point(12, 155)
+    $lblPrompt.AutoSize = $true
+    $lblPrompt.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
+    $form.Controls.Add($lblPrompt)
+
+    $txtCount = New-Object System.Windows.Forms.TextBox
+    $txtCount.Location = New-Object System.Drawing.Point(12, 180)
+    $txtCount.Size = New-Object System.Drawing.Size(140, 24)
+    $txtCount.Font = New-Object System.Drawing.Font("Segoe UI", 11)
+    $form.Controls.Add($txtCount)
+
+    $lblMatch = New-Object System.Windows.Forms.Label
+    $lblMatch.Text = ""
+    $lblMatch.Location = New-Object System.Drawing.Point(160, 184)
+    $lblMatch.AutoSize = $true
+    $form.Controls.Add($lblMatch)
+
+    $btnCancel = New-Object System.Windows.Forms.Button
+    $btnCancel.Text = "Cancel"
+    $btnCancel.Size = New-Object System.Drawing.Size(100, 30)
+    $btnCancel.Location = New-Object System.Drawing.Point(420, 280)
+    $btnCancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+    $form.Controls.Add($btnCancel)
+
+    $btnConfirm = New-Object System.Windows.Forms.Button
+    $btnConfirm.Text = "Confirm"
+    $btnConfirm.Size = New-Object System.Drawing.Size(100, 30)
+    $btnConfirm.Location = New-Object System.Drawing.Point(310, 280)
+    $btnConfirm.Enabled = $false
+    $btnConfirm.DialogResult = [System.Windows.Forms.DialogResult]::OK
+    $form.Controls.Add($btnConfirm)
+
+    $txtCount.Add_TextChanged({
+        $ok = ($txtCount.Text -match ('^\s*' + $ContainerCount + '\s*$'))
+        $btnConfirm.Enabled = $ok
+        $lblMatch.Text = if ($ok) { "OK" } elseif ($txtCount.Text.Length -gt 0) { "does not match" } else { "" }
+    })
+
+    $form.AcceptButton = $btnConfirm
+    $form.CancelButton = $btnCancel
+
+    return ($form.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK)
 }
 
 # --------------------------------------------------------------------
@@ -631,106 +312,116 @@ function Export-GridToCSV {
 function Show-RenamePreviewDialog {
     param(
         $SelectedProfiles,
-        [bool]$OnlyOdfc,
-        [bool]$OnlyProfile
+        [ValidateSet('All', 'Office', 'Profile')][string]$Scope = 'All',
+        [bool]$WhatIf,
+        [bool]$CheckInUse
     )
 
     $previewForm = New-Object System.Windows.Forms.Form
     $previewForm.Text = "Rename Preview"
-    $previewForm.Size = New-Object System.Drawing.Size(800, 500)
+    $previewForm.Size = New-Object System.Drawing.Size(960, 620)
     $previewForm.StartPosition = "CenterParent"
     $previewForm.FormBorderStyle = "Sizable"
+    $previewForm.MinimumSize = New-Object System.Drawing.Size(720, 420)
 
-    $lblInfo = New-Object System.Windows.Forms.Label
-    $lblInfo.Text = "The following files will be renamed:"
-    $lblInfo.Location = New-Object System.Drawing.Point(10, 10)
-    $lblInfo.AutoSize = $true
-    $previewForm.Controls.Add($lblInfo)
+    # --- LIVE / SIMULATION banner ---
+    $banner = New-Object System.Windows.Forms.Panel
+    $banner.Dock = "Top"
+    $banner.Height = 40
+    $banner.BackColor = if ($WhatIf) {
+        [System.Drawing.Color]::FromArgb(200, 200, 200)
+    } else {
+        [System.Drawing.Color]::FromArgb(180, 30, 30)
+    }
+    $previewForm.Controls.Add($banner)
 
+    $lblMode = New-Object System.Windows.Forms.Label
+    $lblMode.Text = if ($WhatIf) { "  SIMULATION  -  no changes will be made" } else { "  LIVE  -  containers WILL be renamed" }
+    $lblMode.Font = New-Object System.Drawing.Font("Segoe UI", 12, [System.Drawing.FontStyle]::Bold)
+    $lblMode.ForeColor = if ($WhatIf) { [System.Drawing.Color]::Black } else { [System.Drawing.Color]::White }
+    $lblMode.Dock = "Fill"
+    $lblMode.TextAlign = "MiddleLeft"
+    $banner.Controls.Add($lblMode)
+
+    # --- Subtitle: operator / users / horizon ---
+    $horizonStatus = if (Test-FSLogixHorizonConnected) { "connected" } else { "not configured" }
+    $subtitle = New-Object System.Windows.Forms.Label
+    $subtitle.Text = "Operator: $env:USERDOMAIN\$env:USERNAME  |  Users: $($SelectedProfiles.Count)  |  Scope: $Scope  |  CheckInUse: $(if ($CheckInUse) {'on'} else {'off'})  |  Horizon: $horizonStatus"
+    $subtitle.Dock = "Top"
+    $subtitle.Height = 22
+    $subtitle.TextAlign = "MiddleLeft"
+    $subtitle.Padding = "6,0,0,0"
+    $previewForm.Controls.Add($subtitle)
+
+    # --- Plan list ---
     $listView = New-Object System.Windows.Forms.ListView
-    $listView.Location = New-Object System.Drawing.Point(10, 35)
-    $listView.Size = New-Object System.Drawing.Size(760, 380)
+    $listView.Dock = "Fill"
     $listView.View = "Details"
     $listView.FullRowSelect = $true
     $listView.GridLines = $true
-    $listView.Anchor = "Top,Left,Right,Bottom"
 
-    [void]$listView.Columns.Add("User", 100)
-    [void]$listView.Columns.Add("Current Path", 300)
-    [void]$listView.Columns.Add("New Path", 300)
-    [void]$listView.Columns.Add("Status", 60)
-
+    [void]$listView.Columns.Add("User", 120)
+    [void]$listView.Columns.Add("Class", 60)
+    [void]$listView.Columns.Add("Current Path", 340)
+    [void]$listView.Columns.Add("New Path", 340)
+    [void]$listView.Columns.Add("State", 80)
+    [void]$listView.Columns.Add("Note", 200)
     $previewForm.Controls.Add($listView)
 
+    $planTotal = 0
     $inUseCount = 0
-
+    $notReadyCount = 0
     foreach ($profile in $SelectedProfiles) {
-        $files = $profile.ContainerFiles
-
-        if ($OnlyOdfc) {
-            $files = $files | Where-Object { $_ -match 'odfc|office' }
-        }
-        if ($OnlyProfile) {
-            $files = $files | Where-Object { $_ -notmatch 'odfc|office' }
-        }
-
-        foreach ($path in $files) {
-            $dir  = Split-Path -Parent $path
-            $name = Split-Path -Leaf  $path
-            $base = [System.IO.Path]::GetFileNameWithoutExtension($name)
-            $ext  = [System.IO.Path]::GetExtension($name)
-            $newName = "{0}-old{1}" -f $base, $ext
-            $newPath = Join-Path $dir $newName
-
-            $status = "OK"
-            if (Test-FileInUse -FilePath $path) {
-                $status = "IN USE"
-                $inUseCount++
-            } elseif (Test-Path $newPath) {
-                $status = "EXISTS"
-            } elseif (-not (Test-Path $path)) {
-                $status = "MISSING"
+        $plan = @(Get-FSLogixRetirePlan -ProfileObject $profile -Scope $Scope -CheckInUse:$CheckInUse)
+        foreach ($item in $plan) {
+            $listItem = New-Object System.Windows.Forms.ListViewItem($item.UserName)
+            [void]$listItem.SubItems.Add($item.Class)
+            [void]$listItem.SubItems.Add($item.SourcePath)
+            [void]$listItem.SubItems.Add($item.DestPath)
+            [void]$listItem.SubItems.Add($item.State)
+            [void]$listItem.SubItems.Add($item.Note)
+            switch ($item.State) {
+                'InUse'        { $listItem.BackColor = [System.Drawing.Color]::LightCoral; $inUseCount++ }
+                'AccessDenied' { $listItem.BackColor = [System.Drawing.Color]::LightYellow; $notReadyCount++ }
+                'Missing'      { $listItem.BackColor = [System.Drawing.Color]::LightYellow; $notReadyCount++ }
+                'Exists'       { $listItem.BackColor = [System.Drawing.Color]::LightYellow; $notReadyCount++ }
             }
-
-            $item = New-Object System.Windows.Forms.ListViewItem($profile.UserName)
-            [void]$item.SubItems.Add($path)
-            [void]$item.SubItems.Add($newPath)
-            [void]$item.SubItems.Add($status)
-
-            if ($status -eq "IN USE") {
-                $item.BackColor = [System.Drawing.Color]::LightCoral
-            } elseif ($status -ne "OK") {
-                $item.BackColor = [System.Drawing.Color]::LightYellow
-            }
-
-            [void]$listView.Items.Add($item)
+            [void]$listView.Items.Add($listItem)
+            $planTotal++
         }
     }
 
-    $lblSummary = New-Object System.Windows.Forms.Label
-    $lblSummary.Text = "Total files: $($listView.Items.Count), In-use: $inUseCount"
-    $lblSummary.Location = New-Object System.Drawing.Point(10, 420)
-    $lblSummary.AutoSize = $true
-    $lblSummary.Anchor = "Bottom,Left"
-    $previewForm.Controls.Add($lblSummary)
+    # --- Summary ---
+    $summary = New-Object System.Windows.Forms.Label
+    $summary.Text = "Plan: $planTotal target(s)  |  In-use: $inUseCount  |  Other not-ready: $notReadyCount"
+    $summary.Dock = "Bottom"
+    $summary.Height = 24
+    $summary.TextAlign = "MiddleLeft"
+    $summary.Padding = "6,0,0,0"
+    $previewForm.Controls.Add($summary)
 
-    $btnProceed = New-Object System.Windows.Forms.Button
-    $btnProceed.Text = "Proceed"
-    $btnProceed.Location = New-Object System.Drawing.Point(600, 420)
-    $btnProceed.Size = New-Object System.Drawing.Size(80, 28)
-    $btnProceed.Anchor = "Bottom,Right"
-    $btnProceed.DialogResult = [System.Windows.Forms.DialogResult]::OK
-    $previewForm.Controls.Add($btnProceed)
+    # --- Buttons ---
+    $btnPanel = New-Object System.Windows.Forms.Panel
+    $btnPanel.Dock = "Bottom"
+    $btnPanel.Height = 44
+    $previewForm.Controls.Add($btnPanel)
 
     $btnCancel = New-Object System.Windows.Forms.Button
     $btnCancel.Text = "Cancel"
-    $btnCancel.Location = New-Object System.Drawing.Point(690, 420)
-    $btnCancel.Size = New-Object System.Drawing.Size(80, 28)
-    $btnCancel.Anchor = "Bottom,Right"
+    $btnCancel.Size = New-Object System.Drawing.Size(90, 30)
+    $btnCancel.Location = New-Object System.Drawing.Point(840, 7)
     $btnCancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
-    $previewForm.Controls.Add($btnCancel)
+    $btnPanel.Controls.Add($btnCancel)
 
-    $previewForm.AcceptButton = $btnProceed
+    $btnProceed = New-Object System.Windows.Forms.Button
+    $btnProceed.Text = "Proceed"
+    $btnProceed.Size = New-Object System.Drawing.Size(90, 30)
+    $btnProceed.Location = New-Object System.Drawing.Point(740, 7)
+    $btnProceed.DialogResult = [System.Windows.Forms.DialogResult]::OK
+    $btnPanel.Controls.Add($btnProceed)
+
+    # Enter -> Cancel, so a stray Enter never retires anything.
+    $previewForm.AcceptButton = $btnCancel
     $previewForm.CancelButton = $btnCancel
 
     return $previewForm.ShowDialog()
@@ -747,11 +438,9 @@ function Apply-Theme {
 
     $script:CurrentTheme = $ThemeName
 
-    # Form
     $form.BackColor = $theme.FormBackColor
     $form.ForeColor = $theme.FormForeColor
 
-    # Apply to all controls recursively
     function Apply-ToControl($ctrl) {
         if ($ctrl -is [System.Windows.Forms.Label]) {
             $ctrl.ForeColor = $theme.FormForeColor
@@ -791,7 +480,6 @@ function Apply-Theme {
             $ctrl.BackColor = $theme.FormBackColor
         }
 
-        # Recurse into child controls
         if ($ctrl.Controls) {
             foreach ($child in $ctrl.Controls) {
                 Apply-ToControl $child
@@ -803,22 +491,37 @@ function Apply-Theme {
         Apply-ToControl $ctrl
     }
 
-    # Update log panel specifically
     if ($script:txtLog) {
         $script:txtLog.BackColor = $theme.LogPanelBackColor
         $script:txtLog.ForeColor = $theme.LogPanelForeColor
     }
 
-    # Store theme highlight color for row highlighting
     $script:CurrentHighlightColor = $theme.HighlightColor
     $script:DefaultRowBackColor = $theme.GridBackColor
 
-    # Refresh row highlights
-    if ($grid) {
-        Refresh-RowHighlights
-    }
+    if ($grid) { Refresh-RowHighlights }
+
+    # Refresh the Reset button's color now that the theme changed.
+    Set-ResetButtonAppearance
 
     Add-LogMessage "Applied theme: $ThemeName" "INFO"
+}
+
+# --------------------------------------------------------------------
+#  Reset button appearance
+# --------------------------------------------------------------------
+function Set-ResetButtonAppearance {
+    $theme = $script:Themes[$script:CurrentTheme]
+    if ($null -eq $theme) { return }
+    if ($chkWhatIf.Checked) {
+        $btnDelete.BackColor = $theme.ButtonBackColor
+        $btnDelete.ForeColor = $theme.ButtonForeColor
+        $btnDelete.Text = "Reset Profile"
+    } else {
+        $btnDelete.BackColor = $theme.LiveButtonColor
+        $btnDelete.ForeColor = [System.Drawing.Color]::White
+        $btnDelete.Text = "Reset Profile  -  LIVE"
+    }
 }
 
 # --------------------------------------------------------------------
@@ -829,6 +532,7 @@ $form.Text = "FSLogix Profile Manager (Horizon IC) - v$appVersion"
 $form.Size = New-Object System.Drawing.Size(1200, 800)
 $form.StartPosition = "CenterScreen"
 $form.AutoScaleMode = 'None'
+$form.MinimumSize = New-Object System.Drawing.Size(960, 640)
 
 # --- Row 1: Profile Root + Load button + version label + Theme ---
 
@@ -878,7 +582,6 @@ $lblVersion.AutoSize = $true
 $lblVersion.ForeColor = [System.Drawing.Color]::DarkGray
 $form.Controls.Add($lblVersion)
 
-# Theme selector
 $lblTheme = New-Object System.Windows.Forms.Label
 $lblTheme.Text = "Theme:"
 $lblTheme.Location = New-Object System.Drawing.Point(860, 15)
@@ -948,7 +651,6 @@ $btnApplyFilter.Location = New-Object System.Drawing.Point(225, 50)
 $btnApplyFilter.Size = New-Object System.Drawing.Size(55, 26)
 $form.Controls.Add($btnApplyFilter)
 
-# Last-used filter
 $chkAge = New-Object System.Windows.Forms.CheckBox
 $chkAge.Text = "Older than"
 $chkAge.Location = New-Object System.Drawing.Point(290, 53)
@@ -969,14 +671,12 @@ $lblDays.Location = New-Object System.Drawing.Point(430, 55)
 $lblDays.AutoSize = $true
 $form.Controls.Add($lblDays)
 
-# Show only issues
 $chkOnlyIssues = New-Object System.Windows.Forms.CheckBox
 $chkOnlyIssues.Text = "Issues only"
 $chkOnlyIssues.Location = New-Object System.Drawing.Point(480, 53)
 $chkOnlyIssues.AutoSize = $true
 $form.Controls.Add($chkOnlyIssues)
 
-# WhatIf
 $chkWhatIf = New-Object System.Windows.Forms.CheckBox
 $chkWhatIf.Text = "WhatIf"
 $chkWhatIf.Location = New-Object System.Drawing.Point(580, 53)
@@ -984,7 +684,6 @@ $chkWhatIf.AutoSize = $true
 $chkWhatIf.Checked = $true
 $form.Controls.Add($chkWhatIf)
 
-# Check In Use
 $chkCheckInUse = New-Object System.Windows.Forms.CheckBox
 $chkCheckInUse.Text = "Skip in-use"
 $chkCheckInUse.Location = New-Object System.Drawing.Point(660, 53)
@@ -992,7 +691,6 @@ $chkCheckInUse.AutoSize = $true
 $chkCheckInUse.Checked = $true
 $form.Controls.Add($chkCheckInUse)
 
-# Highlight big profiles
 $chkHighlight = New-Object System.Windows.Forms.CheckBox
 $chkHighlight.Text = "Highlight >"
 $chkHighlight.Location = New-Object System.Drawing.Point(760, 53)
@@ -1014,14 +712,12 @@ $lblHighlightGb.Location = New-Object System.Drawing.Point(905, 55)
 $lblHighlightGb.AutoSize = $true
 $form.Controls.Add($lblHighlightGb)
 
-# Export button
 $btnExport = New-Object System.Windows.Forms.Button
 $btnExport.Text = "Export CSV"
 $btnExport.Location = New-Object System.Drawing.Point(950, 50)
 $btnExport.Size = New-Object System.Drawing.Size(80, 26)
 $form.Controls.Add($btnExport)
 
-# --- Legend ---
 $lblLegend = New-Object System.Windows.Forms.Label
 $lblLegend.Text = "Legend: "
 $lblLegend.Location = New-Object System.Drawing.Point(1040, 55)
@@ -1074,7 +770,6 @@ $splitContainer.Panel1.Controls.Add($grid)
 $script:DefaultRowBackColor = $grid.DefaultCellStyle.BackColor
 $script:CurrentHighlightColor = [System.Drawing.Color]::MistyRose
 
-# Column sorting state
 $script:SortColumn = -1
 $script:SortAscending = $true
 
@@ -1086,15 +781,15 @@ function Add-Col([string]$header, [int]$width, [string]$sortMode = "Automatic") 
     [void]$grid.Columns.Add($col)
 }
 
-Add-Col "User"          100 "Programmatic"  # col 0
-Add-Col "# Cont"         50 "Programmatic"  # col 1
-Add-Col "Used GB"        70 "Programmatic"  # col 2
-Add-Col "Max GB"         60 "Programmatic"  # col 3
-Add-Col "Office GB"      70 "Programmatic"  # col 4
-Add-Col "Last Write"    120 "Programmatic"  # col 5
-Add-Col "Status"        100 "Programmatic"  # col 6
-Add-Col "SIDs"          150 "Programmatic"  # col 7
-Add-Col "Root Folder"   300 "Programmatic"  # col 8
+Add-Col "User"         120 "Programmatic"  # col 0
+Add-Col "# Cont"        55 "Programmatic"  # col 1
+Add-Col "Size (GB)"     75 "Programmatic"  # col 2  (was "Used GB")
+Add-Col "Max GB"        60 "Programmatic"  # col 3
+Add-Col "Office GB"     70 "Programmatic"  # col 4
+Add-Col "Last Write"   120 "Programmatic"  # col 5
+Add-Col "Status"       130 "Programmatic"  # col 6
+Add-Col "SIDs"         180 "Programmatic"  # col 7
+Add-Col "Root Folder"  300 "Programmatic"  # col 8
 
 # --- Log Panel ---
 
@@ -1109,13 +804,14 @@ $script:txtLog.Location = New-Object System.Drawing.Point(0, 20)
 $script:txtLog.Multiline = $true
 $script:txtLog.ScrollBars = "Vertical"
 $script:txtLog.ReadOnly = $true
+# No MaxLength cap: AppendText no-ops silently at 32,767 chars otherwise.
+$script:txtLog.MaxLength = 0
 $script:txtLog.Font = New-Object System.Drawing.Font("Consolas", 9)
 $script:txtLog.Dock = "None"
 $script:txtLog.Anchor = "Top,Left,Right,Bottom"
 $script:txtLog.Size = New-Object System.Drawing.Size(1160, 100)
 $splitContainer.Panel2.Controls.Add($script:txtLog)
 
-# Adjust log panel size on split
 $splitContainer.Add_SplitterMoved({
     $script:txtLog.Size = New-Object System.Drawing.Size($splitContainer.Panel2.Width, ($splitContainer.Panel2.Height - 25))
 })
@@ -1133,12 +829,12 @@ $btnClearLog.Add_Click({
 
 # --- Bottom row: status + profile/office-only + Reset/Close ---
 
-$lblStatus = New-Object System.Windows.Forms.Label
-$lblStatus.Location = New-Object System.Drawing.Point(10, 715)
-$lblStatus.Size = New-Object System.Drawing.Size(400, 20)
-$lblStatus.Text = "Ready."
-$lblStatus.Anchor = "Bottom,Left"
-$form.Controls.Add($lblStatus)
+$script:lblStatus = New-Object System.Windows.Forms.Label
+$script:lblStatus.Location = New-Object System.Drawing.Point(10, 715)
+$script:lblStatus.Size = New-Object System.Drawing.Size(400, 20)
+$script:lblStatus.Text = "Ready."
+$script:lblStatus.Anchor = "Bottom,Left"
+$form.Controls.Add($script:lblStatus)
 
 $chkDeleteOdfc = New-Object System.Windows.Forms.CheckBox
 $chkDeleteOdfc.Text = "Only ODFC"
@@ -1154,11 +850,9 @@ $chkDeleteProfile.AutoSize = $true
 $chkDeleteProfile.Anchor = "Bottom,Left"
 $form.Controls.Add($chkDeleteProfile)
 
-# Ensure mutual exclusivity
 $chkDeleteOdfc.Add_CheckedChanged({
     if ($chkDeleteOdfc.Checked) { $chkDeleteProfile.Checked = $false }
 })
-
 $chkDeleteProfile.Add_CheckedChanged({
     if ($chkDeleteProfile.Checked) { $chkDeleteOdfc.Checked = $false }
 })
@@ -1185,14 +879,23 @@ $btnClose.Size = New-Object System.Drawing.Size(60, 28)
 $btnClose.Anchor = "Bottom,Right"
 $form.Controls.Add($btnClose)
 
-# Hold all profile objects
+# All profile objects (post-scan)
 $script:AllProfiles = @()
 
-# Utility: show profiles in the grid (manual rows + highlight)
+# --------------------------------------------------------------------
+#  Show profiles in the grid
+# --------------------------------------------------------------------
 function Show-ProfilesInGrid {
     param(
         [System.Collections.IEnumerable]$Profiles
     )
+
+    # Capture current selection so we can restore it after the repaint.
+    $priorUsers = New-Object System.Collections.Generic.HashSet[string]
+    foreach ($sel in $grid.SelectedRows) {
+        if ($sel.Tag -and $sel.Tag.UserName) { [void]$priorUsers.Add($sel.Tag.UserName) }
+    }
+    $priorTopRow = $grid.FirstDisplayedScrollingRowIndex
 
     $grid.Rows.Clear()
 
@@ -1201,32 +904,26 @@ function Show-ProfilesInGrid {
         $row = $grid.Rows[$idx]
         $row.Cells[0].Value = $p.UserName
         $row.Cells[1].Value = $p.ContainerCount
-        $row.Cells[2].Value = [Math]::Round($p.TotalSizeGB, 1)
-        $row.Cells[3].Value = $p.MaxSizeGB
-        $row.Cells[4].Value = [Math]::Round($p.OfficeSizeGB, 1)
-        $row.Cells[5].Value = $p.LastWriteTime.ToString("yyyy-MM-dd HH:mm")
+        $row.Cells[2].Value = [Math]::Round($p.TotalSizeGB, 2)
+        # MaxSizeGB may be $null when neither Get-VHD nor ConfiguredMaxSizeGB was available.
+        $row.Cells[3].Value = if ($null -ne $p.MaxSizeGB) { [Math]::Round($p.MaxSizeGB, 1) } else { '' }
+        $row.Cells[4].Value = [Math]::Round($p.OfficeSizeGB, 2)
+        $row.Cells[5].Value = if ($p.LastWriteTime) { $p.LastWriteTime.ToString("yyyy-MM-dd HH:mm") } else { '' }
 
-        # Status column
         $issues = @($p.HealthIssues)
-        if ($issues.Count -eq 0) {
-            $row.Cells[6].Value = "OK"
-        } else {
-            $row.Cells[6].Value = ($issues -join ", ")
-        }
+        $row.Cells[6].Value = if ($issues.Count -eq 0) { "OK" } else { ($issues -join ", ") }
         $row.Cells[6].ToolTipText = "AD Status: $($p.ADStatus)"
 
-        # SID column - show abbreviated SIDs
+        # SIDs - show abbreviated when more than 2; full list in tooltip.
         $sidList = @($p.SIDs)
         if ($sidList.Count -le 2) {
             $row.Cells[7].Value = ($sidList -join "; ")
         } else {
-            $row.Cells[7].Value = "$($sidList[0]); ... (+$($sidList.Count - 1) more)"
+            $row.Cells[7].Value = ($sidList[0..1] -join "; ") + "; ... (+$($sidList.Count - 2) more)"
         }
         $row.Cells[7].ToolTipText = ($sidList -join "`n")
 
         $row.Cells[8].Value = $p.RootFolder
-
-        # Store the object on the row for later use
         $row.Tag = $p
 
         Update-RowHighlight -Row $row `
@@ -1235,15 +932,24 @@ function Show-ProfilesInGrid {
                             -ThresholdGB ([double]$numHighlight.Value) `
                             -DefaultColor $script:DefaultRowBackColor `
                             -HighlightColor $script:CurrentHighlightColor
+
+        if ($priorUsers.Contains($p.UserName)) { $row.Selected = $true }
+    }
+
+    # Don't auto-select row 0 - the four-click mass retire relied on this.
+    if ($grid.SelectedRows.Count -eq 0 -and $grid.Rows.Count -gt 0) {
+        $grid.ClearSelection()
+    }
+
+    if ($null -ne $priorTopRow -and $priorTopRow -ge 0 -and $priorTopRow -lt $grid.Rows.Count) {
+        $grid.FirstDisplayedScrollingRowIndex = $priorTopRow
     }
 }
 
-# Helper to re-apply highlight to all rows when settings change
 function Refresh-RowHighlights {
     foreach ($row in $grid.Rows) {
         $obj = $row.Tag
         if (-not $obj) { continue }
-
         Update-RowHighlight -Row $row `
                             -ProfileObject $obj `
                             -HighlightEnabled $chkHighlight.Checked `
@@ -1253,13 +959,14 @@ function Refresh-RowHighlights {
     }
 }
 
-# Column header click for sorting
+# --------------------------------------------------------------------
+#  Column header click for sorting
+# --------------------------------------------------------------------
 $grid.Add_ColumnHeaderMouseClick({
     param($sender, $e)
 
     $colIndex = $e.ColumnIndex
 
-    # Toggle sort direction if same column
     if ($script:SortColumn -eq $colIndex) {
         $script:SortAscending = -not $script:SortAscending
     } else {
@@ -1267,18 +974,16 @@ $grid.Add_ColumnHeaderMouseClick({
         $script:SortAscending = $true
     }
 
-    # Get current filtered profiles
     $profiles = @()
     foreach ($row in $grid.Rows) {
         if ($row.Tag) { $profiles += $row.Tag }
     }
 
-    # Sort based on column
     $sorted = switch ($colIndex) {
         0 { $profiles | Sort-Object UserName }
         1 { $profiles | Sort-Object ContainerCount }
         2 { $profiles | Sort-Object TotalSizeGB }
-        3 { $profiles | Sort-Object MaxSizeGB }
+        3 { $profiles | Sort-Object { if ($_.MaxSizeGB) { $_.MaxSizeGB } else { -1 } } }
         4 { $profiles | Sort-Object OfficeSizeGB }
         5 { $profiles | Sort-Object LastWriteTime }
         6 { $profiles | Sort-Object { ($_.HealthIssues | Measure-Object).Count } }
@@ -1288,12 +993,14 @@ $grid.Add_ColumnHeaderMouseClick({
     }
 
     if (-not $script:SortAscending) {
-        [array]::Reverse($sorted)
+        # [array]::Reverse throws on a 0- or 1-row grid.
+        $arr = @($sorted)
+        if ($arr.Count -gt 1) { [array]::Reverse($arr) }
+        $sorted = $arr
     }
 
     Show-ProfilesInGrid $sorted
 
-    # Update column header to show sort indicator
     foreach ($col in $grid.Columns) {
         $col.HeaderCell.SortGlyphDirection = "None"
     }
@@ -1302,35 +1009,32 @@ $grid.Add_ColumnHeaderMouseClick({
     Add-LogMessage "Sorted by column $($grid.Columns[$colIndex].HeaderText) $(if($script:SortAscending){'ascending'}else{'descending'})" "INFO"
 })
 
-# Load profiles function (shared by Load and Rescan)
+# --------------------------------------------------------------------
+#  Load profiles
+# --------------------------------------------------------------------
 function Load-Profiles {
     try {
-        $lblStatus.Text = "Loading..."
+        $script:lblStatus.Text = "Loading..."
         $form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
         Add-LogMessage "Loading profiles..." "INFO"
 
-        # Clear AD cache
-        $script:ADCheckCache = @{}
+        Clear-FSLogixADCache
 
         $roots = $txtRoot.Text -split ';' | ForEach-Object { $_.Trim() } | Where-Object { $_ }
-        $script:AllProfiles = Get-FSLogixProfiles -ProfileRoots $roots -CheckOrphans $chkCheckOrphans.Checked
+        $script:AllProfiles = @(Get-FSLogixProfiles -ProfileRoots $roots -CheckOrphans:$chkCheckOrphans.Checked)
 
-        $filtered = Apply-Filters -Source $script:AllProfiles `
-                                  -UserFilter $txtFilter.Text `
-                                  -UseAge $chkAge.Checked `
-                                  -AgeDays ([int]$numAge.Value) `
-                                  -OnlyIssues $chkOnlyIssues.Checked
+        $ageDays = if ($chkAge.Checked) { [int]$numAge.Value } else { 0 }
+        $filtered = @(Select-FSLogixProfile -Source $script:AllProfiles -UserFilter @(,$txtFilter.Text) -AgeDays $ageDays -OnlyIssues:$chkOnlyIssues.Checked)
 
         Show-ProfilesInGrid $filtered
 
-        # Count issues
-        $issueCount = ($script:AllProfiles | Where-Object { $_.HealthIssues.Count -gt 0 }).Count
-        $lblStatus.Text = "Loaded $($filtered.Count) user(s) from $($roots.Count) root(s). Issues: $issueCount"
+        $issueCount = @($script:AllProfiles | Where-Object { $_.HealthIssues.Count -gt 0 }).Count
+        $script:lblStatus.Text = "Loaded $($filtered.Count) user(s) from $($roots.Count) root(s). Issues: $issueCount"
         Add-LogMessage "Loaded $($filtered.Count) user(s), $issueCount with issues" "INFO"
     }
     catch {
         [System.Windows.Forms.MessageBox]::Show("Error: $($_.Exception.Message)")
-        $lblStatus.Text = "Error loading profiles."
+        $script:lblStatus.Text = "Error loading profiles."
         Add-LogMessage "Error: $($_.Exception.Message)" "ERROR"
     }
     finally {
@@ -1338,40 +1042,52 @@ function Load-Profiles {
     }
 }
 
-# Load button
 $btnLoad.Add_Click({ Load-Profiles })
 
-# Rescan button (same as load, but logs differently)
 $btnRescan.Add_Click({
     Add-LogMessage "Manual rescan triggered" "INFO"
     Load-Profiles
 })
 
-# Apply Filter
 $btnApplyFilter.Add_Click({
     if (-not $script:AllProfiles -or $script:AllProfiles.Count -eq 0) { return }
 
-    $filtered = Apply-Filters -Source $script:AllProfiles `
-                              -UserFilter $txtFilter.Text `
-                              -UseAge $chkAge.Checked `
-                              -AgeDays ([int]$numAge.Value) `
-                              -OnlyIssues $chkOnlyIssues.Checked
+    $ageDays = if ($chkAge.Checked) { [int]$numAge.Value } else { 0 }
+    $filtered = @(Select-FSLogixProfile -Source $script:AllProfiles -UserFilter @(,$txtFilter.Text) -AgeDays $ageDays -OnlyIssues:$chkOnlyIssues.Checked)
 
     Show-ProfilesInGrid $filtered
-    $lblStatus.Text = "Filter: $($filtered.Count) user(s)"
+    $script:lblStatus.Text = "Filter: $($filtered.Count) user(s)"
     Add-LogMessage "Filter applied: $($filtered.Count) user(s) match" "INFO"
 })
 
-# Re-apply highlights when highlight options change
+# Enter inside the filter box should apply the filter.
+$txtFilter.Add_KeyDown({
+    if ($_.KeyCode -eq [System.Windows.Forms.Keys]::Enter) {
+        $btnApplyFilter.PerformClick()
+        $_.Handled = $true
+    }
+})
+
+$chkAge.Add_CheckedChanged({
+    if ($script:AllProfiles -and $script:AllProfiles.Count -gt 0) { $btnApplyFilter.PerformClick() }
+})
+$chkOnlyIssues.Add_CheckedChanged({
+    if ($script:AllProfiles -and $script:AllProfiles.Count -gt 0) { $btnApplyFilter.PerformClick() }
+})
+$numAge.Add_ValueChanged({
+    if ($chkAge.Checked -and $script:AllProfiles -and $script:AllProfiles.Count -gt 0) { $btnApplyFilter.PerformClick() }
+})
+
 $chkHighlight.Add_CheckedChanged({ Refresh-RowHighlights })
 $numHighlight.Add_ValueChanged({ Refresh-RowHighlights })
 
-# Theme change
+# Live/WhatIf changes the Reset button color immediately.
+$chkWhatIf.Add_CheckedChanged({ Set-ResetButtonAppearance })
+
 $cmbTheme.Add_SelectedIndexChanged({
     Apply-Theme $cmbTheme.SelectedItem.ToString()
 })
 
-# Export CSV
 $btnExport.Add_Click({
     if ($grid.Rows.Count -eq 0) {
         [System.Windows.Forms.MessageBox]::Show("No data to export.")
@@ -1389,77 +1105,127 @@ $btnExport.Add_Click({
     }
 })
 
-# Reset Profile (Retire / rename) Selected
+# --------------------------------------------------------------------
+#  Reset Profile (retire / rename) Selected
+# --------------------------------------------------------------------
 $btnDelete.Add_Click({
     if ($grid.SelectedRows.Count -eq 0) {
-        [System.Windows.Forms.MessageBox]::Show("No users selected.")
+        [System.Windows.Forms.MessageBox]::Show("No users selected. Click one or more rows first.")
         return
     }
 
-    $count = $grid.SelectedRows.Count
-    $whatIf = $chkWhatIf.Checked
-    $onlyOdfc = $chkDeleteOdfc.Checked
-    $onlyProfile = $chkDeleteProfile.Checked
-    $checkInUse = $chkCheckInUse.Checked
-    $showPreview = $chkPreview.Checked
+    $whatIf       = $chkWhatIf.Checked
+    $checkInUse   = $chkCheckInUse.Checked
+    $showPreview  = $chkPreview.Checked
+    $scope        = if ($chkDeleteOdfc.Checked) { 'Office' }
+                    elseif ($chkDeleteProfile.Checked) { 'Profile' }
+                    else { 'All' }
 
-    # Gather selected profiles
     $selectedProfiles = @()
     foreach ($row in $grid.SelectedRows) {
         if ($row.Tag) { $selectedProfiles += $row.Tag }
     }
 
-    # Show preview dialog if enabled
+    # Build the plan up front so the same numbers appear in preview and confirmation.
+    $planTotal = 0
+    foreach ($p in $selectedProfiles) {
+        $plan = @(Get-FSLogixRetirePlan -ProfileObject $p -Scope $scope -CheckInUse:$checkInUse)
+        $planTotal += $plan.Count
+    }
+
+    # 1. Preview dialog (optional)
     if ($showPreview) {
-        $previewResult = Show-RenamePreviewDialog -SelectedProfiles $selectedProfiles -OnlyOdfc $onlyOdfc -OnlyProfile $onlyProfile
+        $previewResult = Show-RenamePreviewDialog -SelectedProfiles $selectedProfiles -Scope $scope -WhatIf $whatIf -CheckInUse $checkInUse
         if ($previewResult -ne [System.Windows.Forms.DialogResult]::OK) {
             Add-LogMessage "Rename cancelled from preview dialog" "INFO"
             return
         }
-    } else {
-        # Standard confirmation
-        $modeText = if ($onlyOdfc) {
-            "ODFC/Office containers only"
-        } elseif ($onlyProfile) {
-            "Profile containers only"
-        } else {
-            "ALL containers for selected users"
+    }
+
+    # 2. Proportionate confirmation - always shown
+    $confirmed = Show-ResetConfirmation -SelectedProfiles $selectedProfiles -ContainerCount $planTotal -WhatIf $whatIf -Scope $scope
+    if (-not $confirmed) {
+        Add-LogMessage "Rename cancelled at confirmation" "INFO"
+        return
+    }
+
+    Add-LogMessage "Starting reset for $($selectedProfiles.Count) user(s), $planTotal container(s), mode=$scope, whatIf=$whatIf" "INFO"
+
+    # Honour the GUI's own confirmation; never let the module's prompt fire.
+    $WhatIfPreference = $whatIf
+    $results = @()
+    try {
+        foreach ($obj in $selectedProfiles) {
+            $r = Rename-FSLogixProfileObject -ProfileObject $obj -Scope $scope -CheckInUse:$checkInUse -Confirm:$false
+            $results += $r
         }
-
-        $resp = [System.Windows.Forms.MessageBox]::Show(
-            "Reset profile (retire/rename containers) for $count user(s)?`n`nMode: $modeText`nWhatIf = $whatIf`nSkip in-use = $checkInUse`n`nContainers will be renamed to *-old.vhd(x).",
-            "Confirm Reset Profile",
-            [System.Windows.Forms.MessageBoxButtons]::YesNo
-        )
-
-        if ($resp -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+    } finally {
+        $WhatIfPreference = $false
     }
 
-    Add-LogMessage "Starting rename operation for $count user(s)" "INFO"
-
-    $logs = @()
-
-    foreach ($obj in $selectedProfiles) {
-        $logFile = Rename-FSLogixProfileObject -ProfileObject $obj -WhatIf:$whatIf -OnlyOdfc:$onlyOdfc -OnlyProfile:$onlyProfile -CheckInUse:$checkInUse
-        $logs += $logFile
+    # Aggregate counts and show them in the status bar and a result dialog.
+    $totals = [PSCustomObject]@{
+        Planned       = 0
+        Renamed       = 0
+        SkippedInUse  = 0
+        SkippedExists = 0
+        Missing       = 0
+        Failed        = 0
+        AbortedCount  = 0
+        AbortReasons  = @()
+        Logs          = @()
+    }
+    foreach ($r in $results) {
+        $totals.Planned       += $r.Planned
+        $totals.Renamed       += $r.Renamed
+        $totals.SkippedInUse  += $r.SkippedInUse
+        $totals.SkippedExists += $r.SkippedExists
+        $totals.Missing       += $r.Missing
+        $totals.Failed        += $r.Failed
+        if ($r.Aborted) {
+            $totals.AbortedCount++
+            $totals.AbortReasons += "$($r.UserName): $($r.AbortReason)"
+        }
+        if ($r.LogPath) { $totals.Logs += $r.LogPath }
     }
 
-    [System.Windows.Forms.MessageBox]::Show("Completed. Logs:`n`n$($logs -join "`n")")
+    $modeName = if ($whatIf) { "WHATIF" } else { "LIVE" }
+    $script:lblStatus.Text = "[$modeName] renamed $($totals.Renamed), in-use $($totals.SkippedInUse), exists $($totals.SkippedExists), missing $($totals.Missing), failed $($totals.Failed) (of $($totals.Planned) planned)"
 
-    # Reload to reflect renames
-    Load-Profiles
+    $resultText  = "Mode: $modeName`n`n"
+    $resultText += "Planned:           $($totals.Planned)`n"
+    $resultText += "Renamed:           $($totals.Renamed)`n"
+    $resultText += "Skipped (in-use):  $($totals.SkippedInUse)`n"
+    $resultText += "Skipped (exists):  $($totals.SkippedExists)`n"
+    $resultText += "Missing:           $($totals.Missing)`n"
+    $resultText += "Failed:            $($totals.Failed)`n"
+    if ($totals.AbortedCount -gt 0) {
+        $resultText += "`nAborted ($($totals.AbortedCount)):`n"
+        foreach ($r in $totals.AbortReasons) { $resultText += "  $r`n" }
+    }
+    if ($totals.Logs.Count -gt 0) {
+        $resultText += "`nLogs:`n"
+        foreach ($l in $totals.Logs) { $resultText += "  $l`n" }
+    }
+    [System.Windows.Forms.MessageBox]::Show($resultText, "Reset Results - $modeName")
+
+    # Don't pay a second full-share freeze for a WhatIf.
+    if (-not $whatIf) {
+        Load-Profiles
+    } else {
+        Add-LogMessage "Skipping rescan after WhatIf run." "INFO"
+    }
 })
 
-# Close
 $btnClose.Add_Click({ $form.Close() })
 
-# Apply initial theme
+# --------------------------------------------------------------------
+#  Apply initial theme and start
+# --------------------------------------------------------------------
 Apply-Theme "Light"
 
-# Initial log message
 Add-LogMessage "FSLogix Profile Manager v$appVersion started" "INFO"
 Add-LogMessage "Ready. Enter profile root path(s) and click 'Load Profiles'" "INFO"
 Add-LogMessage "Enable 'Check AD' to detect orphaned profiles (requires AD connectivity)" "INFO"
 
-# Run
 [void]$form.ShowDialog()
