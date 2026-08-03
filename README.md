@@ -44,8 +44,11 @@ all `*.vhd` / `*.vhdx` containers beneath it are discovered and aggregated.
   - Filter by "AD last logon > X days" (`lastLogonTimestamp`).
   - Issues-only filter.
 - **Reset Profile modes:**
-  - **WhatIf (simulate)** – default for the GUI; required for any
-    non-WhatIf CLI run via `-WhatIf` or by typing a count.
+  - **WhatIf (simulate)** – on by default in the GUI (checkbox is
+    pre-checked; the Reset button turns red and reads "Reset Profile -
+    LIVE" the moment you uncheck it). In the CLI, pass `-WhatIf`
+    explicitly — there is no auto-WhatIf, and a bare CLI call with no
+    filter is refused outright (see Safety contract below).
   - **Only ODFC (Office)** / **Only Profile** checkboxes map to `-Scope
     Office` / `-Scope Profile` in the module.
   - Reset all containers (Profile + Office) when both toggles are off.
@@ -149,7 +152,9 @@ all `*.vhd` / `*.vhdx` containers beneath it are discovered and aggregated.
 
 ### Reset main Profile only
 
-- Check **Only Profile** to target only the non-ODFC container.
+- Check **Only Profile** to target only the Profile container
+  (`Class -eq 'Profile'`). This excludes both Office and Unknown
+  containers — different from the old `-notmatch 'odfc|office'` rule.
 
 ### Reset all containers
 
@@ -161,10 +166,10 @@ all `*.vhd` / `*.vhdx` containers beneath it are discovered and aggregated.
 - A **Reason / Ticket** is required.
 - The Reset button reads **Reset Profile - LIVE** in red whenever
   WhatIf is off.
-- The preview dialog is non-modal only at the source: the **Proceed**
-  button on the preview is not the default, and the confirmation that
-  follows it requires the operator to type the container count when the
-  selection is large.
+- The preview dialog is modal. **Cancel** is the AcceptButton — a
+  stray Enter never retires anything. The proportionate confirmation
+  that follows it requires the operator to type the container count
+  when the selection is large.
 - A second full-share freeze never happens after a WhatIf run.
 - An audit row is written for every action. A failed write aborts the
   operation when a central audit root was set.
@@ -193,8 +198,9 @@ logic.
 
 - A bare call with no filter is **refused outright**. Specify
   `-User`, `-LastUsedDays`, or an explicit `-All`.
-- A live run uses `SupportsShouldProcess`; a `-WhatIf` run is the
-  default for any path that ends in a rename.
+- A live run uses `SupportsShouldProcess`; pass `-WhatIf` to
+  simulate. The CLI does **not** default to WhatIf — a call with no
+  `-WhatIf` and no `-Confirm:$false` will prompt.
 - In-use checking is on by default. Pass `-CheckInUse:$false` to
   disable (and accept the risk).
 - `-Force` allows retiring a row whose identity could not be parsed
@@ -225,6 +231,9 @@ logic.
 - `-OnlyOdfc` and `-OnlyProfile` are gone; use `-Scope Office` /
   `-Scope Profile`.
 - A bare call with no filter now exits with an error.
+- In-use checking is now on by default. The v1 CLI never checked
+  at all. Pass `-CheckInUse:$false` to fall back to the old
+  (unsafe) behaviour.
 
 ---
 
