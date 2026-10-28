@@ -1,4 +1,4 @@
-# Remaining work
+﻿# Remaining work
 
 The GUI and CLI both import the shared core module. Older descriptions saying
 that migration has not happened are obsolete. The October 2026 test pass fixes
@@ -29,7 +29,7 @@ adapter tests. See docs/VERIFICATION.md for exactly what is covered.
 - Configurable Horizon API versions, pagination, token refresh/logout, and a
   separately reviewed logoff/clone-refresh workflow.
 - Recovery UI for superseded containers and pre-manifest managed retirements.
-- Persist user settings between application launches.
+- Optional autosave for an active environment; current Save is explicit and last-selection restore is implemented.
 - Add an installer or an explicitly configured deployment destination if needed.
 
 ## Possible future scope

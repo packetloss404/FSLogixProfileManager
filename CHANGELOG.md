@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+### 0.9.0 features
+
+- Saved named environments with explicit Save/update/delete, last-selected startup
+  restore, audit/default semantics, Horizon reconnect hints, filters, theme and
+  grid layout. Schema validation, atomic concurrent writes and the 4 MB limit
+  protect saved files. Applying clears stale state and restores simulation safety;
+  no credentials, tokens, TLS bypass, tickets or live choices are captured.
+- User details from a toolbar button or row double-click: live files/replicas,
+  retired files, scan-labelled AD/health metadata, associated audit events and
+  explicit Horizon status. Availability refresh is opt-in and read-only; unknown
+  replica metadata stays unknown. Same-name known SIDs remain separate.
+- Searchable audit history across monthly CSVs with literal user/ticket/operator,
+  exact SID/action and inclusive UTC date filters, sortable results, full records,
+  Dark theme and visible source errors. History files are never rewritten.
+- Restore, displacement and rollback audit rows now retain each file's identity
+  across multi-user batches. Host logging return values are suppressed so they
+  cannot contaminate returned profile arrays. Strict retired reports surface
+  missing roots and enumeration errors to the details view.
+- Added persistence/API, native GUI and cross-feature tests. Portable artifacts
+  include required Private/ and UI/ sources and receive a relocated STA smoke
+  launch before upload. No deployment was requested or performed.
+- Documented workflows and limits in docs/FEATURES.md and docs/VERIFICATION.md.
+- Verified 647 assertions across 12 Windows PowerShell 5.1 suites, plus the
+  relocated portable app and clear missing-dependency startup failures.
+
+### 0.8.0 development verification (previous snapshot)
+
 October 2026 verification and correctness fixes (development version 0.8.0).
 
 - Added Windows PowerShell 5.1 CI on push/PR, an isolated timeout-bounded test

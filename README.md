@@ -1,8 +1,8 @@
-# FSLogix Profile Manager (Horizon IC)
+﻿# FSLogix Profile Manager (Horizon IC)
 
 Windows PowerShell scripts for inspecting and retiring FSLogix profile containers:
 `FSLogixProfileGUI.ps1` is a WinForms application and `FSLogixResetProfile.ps1` is
-a CLI. Both use `FSLogixProfileCore.psm1`. The current development version is 0.8.0.
+a CLI. Both use `FSLogixProfileCore.psm1`. The current development version is 0.9.0.
 
 Retirement preserves containers with a timestamped `-old-yyyyMMdd-HHmmss` name.
 Only the explicit retired-container purge operation deletes files.
@@ -20,6 +20,24 @@ Set **Profile Root** before loading; the historical default is
 `\\fml-fslogix\FSLogixUserProfiles`. Separate roots with semicolons.
 The GUI starts in **WhatIf** mode. Select rows deliberately, review the preview,
 and supply **Reason / Ticket** before a live reset.
+
+## Saved environments and investigation
+
+- **Save / Manage...** captures named roots, audit destination, Horizon server
+  hint, filters, theme, highlighting and column layout in per-user JSON.
+  **Apply** restores safe simulation defaults and requires a fresh scan/reconnect.
+  The last selected environment loads on normal startup; no credentials or live
+  operation choices are saved. Saving is explicit, with no autosave on close.
+- **User details...** or double-click shows the selected SID identity's live
+  containers/replicas, retired files, AD/health snapshot, audit actions and
+  Horizon status. **Refresh availability** explicitly probes locks/sessions.
+- **Audit history...** searches monthly CSVs by user, SID, ticket/reason,
+  operator, action and inclusive UTC dates. Sort results and inspect full records.
+  Errors are visible; source files remain unchanged.
+
+See [the feature guide](docs/FEATURES.md) for storage paths, startup precedence,
+read-only behavior, identity matching and recovery from configuration errors.
+Keep the **Private/** and **UI/** folders beside the scripts when copying the app.
 
 ## Discovery and inspection
 

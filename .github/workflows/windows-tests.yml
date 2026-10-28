@@ -25,11 +25,17 @@ jobs:
           New-Item -ItemType Directory -Path dist | Out-Null
           Copy-Item FSLogixProfileCore.psm1,FSLogixProfileGUI.ps1,FSLogixResetProfile.ps1,README.md,CHANGELOG.md,LICENSE -Destination dist
           Copy-Item -Recurse docs -Destination dist
+          Copy-Item -Recurse Private,UI -Destination dist
           @{
             Commit = '${{ github.sha }}'
             Run = '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}'
             Runtime = 'Windows PowerShell 5.1; WinForms requires STA'
           } | ConvertTo-Json | Set-Content dist\build-info.json -Encoding UTF8
+      - name: Verify relocated portable app
+        shell: powershell
+        run: |
+          powershell.exe -NoProfile -NonInteractive -STA -ExecutionPolicy Bypass -File .\tests\Assert-PortableBundle.ps1 -BundlePath .\dist
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - uses: actions/upload-artifact@v7
         with:
           name: FSLogixProfileManager-${{ github.sha }}

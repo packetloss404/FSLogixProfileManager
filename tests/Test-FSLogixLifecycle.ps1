@@ -284,10 +284,32 @@ try {
     } finally {
         & $module { ${function:Get-FSLogixHorizonSession} = $script:SavedSessionQuery; $script:HorizonConnection = $null }
     }
+    Write-Host '-- searchable audit links retain each identity in a multi-user restore --'
+    $root = Join-Path $sandbox 'auditIdentity'
+    $aliceSid = 'S-1-5-21-1-2-3-2001'; $bobSid = 'S-1-5-21-1-2-3-2002'
+    $null = New-Container (Join-Path $root ("alice_$aliceSid\Profile_alice.vhdx"))
+    $null = New-Container (Join-Path $root ("bob_$bobSid\Profile_bob.vhdx"))
+    $identities = Get-FSLogixProfiles -ProfileRoots $root
+    foreach ($identityRow in $identities) {
+        $null = Rename-FSLogixProfileObject -ProfileObject $identityRow -MoveToRetired -Reason 'audit identity retire' -Confirm:$false
+    }
+    $records = Get-FSLogixRetiredContainer -ProfileRoots $root
+    $r = Restore-FSLogixProfileBatch -Container $records -Reason 'audit identity restore' -Confirm:$false
+    Assert 'multi-user batch restores both identities' $r.Restored 2
+    $aliceHistory = Get-FSLogixAuditHistory -AuditRoot $audit -Sid $aliceSid -Action RESTORE
+    $bobHistory = Get-FSLogixAuditHistory -AuditRoot $audit -Sid $bobSid -Action RESTORE
+    Assert 'Alice SID search finds restore intent and completion' $aliceHistory.Count 2
+    Assert 'Bob SID search finds restore intent and completion' $bobHistory.Count 2
+    Assert 'Bob restore records keep Bob username' (@($bobHistory | Where-Object TargetUser -ne 'bob').Count) 0
+    $aliceRow = $identities | Where-Object Sid -eq $aliceSid
+    $details = Get-FSLogixProfileDetails -ProfileObject $aliceRow -AuditRoot $audit
+    Assert 'details links actual retirement and restoration' (@($details.AuditHistory | Where-Object Action -eq RESTORE).Count) 2
+    Assert 'details excludes other restored identity' (@($details.AuditHistory | Where-Object TargetSid -eq $bobSid).Count) 0
     $auditFiles = @(Get-ChildItem -LiteralPath $audit -Filter actions_*.csv)
     $rows = @(Import-Csv -LiteralPath $auditFiles[0].FullName)
     Assert 'live actions produce real audit records' ($rows.Count -gt 0) $true
     Assert 'audit records carry operator reason' (@($rows | Where-Object Reason -eq 'restore test').Count -gt 0) $true
+    Assert 'rollback audit records retain per-file SID' (@($rows | Where-Object { $_.Action -eq 'RESTORE-ROLLBACK' -and -not $_.TargetSid }).Count) 0
     Write-Host "ALL $script:checks LIFECYCLE CHECKS PASSED"
 } finally {
     $resolvedSandbox = [IO.Path]::GetFullPath($sandbox)

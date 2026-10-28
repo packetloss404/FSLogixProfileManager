@@ -46,6 +46,9 @@ try {
     $caught = $false
     try { [void](Get-FSLogixProfiles -ProfileRoots @($testRoot, (Join-Path $testRoot 'missing-root')) -ErrorOnIncomplete) } catch { $caught = $true }
     Assert 'strict discovery refuses an unavailable provider' $caught
+    $caught = $false
+    try { [void](Get-FSLogixRetiredContainer -ProfileRoots (Join-Path $testRoot 'missing-root') -ErrorOnIncomplete) } catch { $caught = $true }
+    Assert 'strict retired report refuses an unavailable root' $caught
     & $module {
         function script:Get-ChildItem {
             [CmdletBinding()]
@@ -57,7 +60,14 @@ try {
         $caught = $false
         try { [void](Get-FSLogixProfiles -ProfileRoots $testRoot -ErrorOnIncomplete) } catch { $caught = $true }
         Assert 'strict discovery refuses partial enumeration' $caught
+        $caught = $false
+        try { [void](Get-FSLogixRetiredContainer -ProfileRoots $testRoot -ErrorOnIncomplete) } catch { $caught = $true }
+        Assert 'strict retired report refuses partial enumeration' $caught
     } finally { & $module { Remove-Item Function:Get-ChildItem } }
+    Set-FSLogixLogHandler { param($Message, $Level) 'handler return value must not become data' }
+    $profiles = Get-FSLogixProfiles -ProfileRoots $testRoot
+    Assert 'logging callback results never contaminate collection data' ($profiles -is [array] -and @($profiles | Where-Object {$_.Containers -is [array]}).Count -eq $profiles.Count)
+    Set-FSLogixLogHandler { param($Message, $Level) }
 
     # Test metadata adapter without installing Hyper-V or inventing a size.
     & $module {
@@ -94,6 +104,7 @@ try {
     $credential = New-Object pscredential('LAB\operator', (ConvertTo-SecureString 'synthetic-password' -AsPlainText -Force))
     [void](Connect-FSLogixHorizon -Server 'synthetic.invalid' -Credential $credential -SkipCertificateCheck)
     Assert 'Horizon connected after token' (Test-FSLogixHorizonConnected)
+    Assert 'Horizon server getter exposes only server name' ((Get-FSLogixHorizonServer) -eq 'synthetic.invalid')
     $calls = & $module { ,@($script:RestCalls) }
     $login = $calls[0].Body | ConvertFrom-Json
     Assert 'domain credential parsed' ($login.username -eq 'operator' -and $login.domain -eq 'LAB')
@@ -121,6 +132,7 @@ try {
     try { [void](Connect-FSLogixHorizon -Server 'synthetic.invalid' -Credential $credential -SkipCertificateCheck) } catch { $caught = $true }
     Assert 'login failure surfaces' $caught
     Assert 'failed reconnect clears old connection' (-not (Test-FSLogixHorizonConnected))
+    Assert 'cleared connection has no saved server value' ($null -eq (Get-FSLogixHorizonServer))
     Assert 'callback restored on login failure' ([object]::Equals($previousCallback, [Net.ServicePointManager]::ServerCertificateValidationCallback))
     & $module { $script:RestFailure = $false; $script:LoginToken = '' }
     $caught = $false

@@ -13,17 +13,23 @@ STA process. Timeouts and failed assertions fail the run. CI uses the same
 command on Windows Server 2022. There is no browser application in this repo;
 following the user's clarification, native GUI tests cover the application.
 
-Local verification on 2026-10-28 under Windows PowerShell 5.1 passed all five
-suites: 41 core checks, 83 lifecycle checks, 87 native GUI checks, 81 CLI checks,
-and 47 adapter checks (339 total). These counts describe the checked-in suites,
-not 339 distinct production integrations. Syntax validation and the aggregate
-runner also passed. The last two adapter assertions were run after the full
-aggregate run to verify mixed-server SMB requests fail closed.
+Version 0.9.0 verification on 2026-10-28 under Windows PowerShell 5.1 covers
+12 suites and 647 assertions: core (41), lifecycle (90), main GUI (87), CLI (81),
+adapters (52), environment API (68)/GUI (65), audit API (38)/GUI (32), details
+API (43)/GUI (29), and cross-feature navigation (21). These describe local
+fixtures and stubbed adapters, not distinct production integrations. Syntax
+validation and a relocated portable-bundle STA smoke launch are also checked.
+The final aggregate run passed all 647 assertions. Missing Private/ and UI/
+dependencies were also checked to produce explicit startup errors.
 
 ## Advertised-feature coverage
 
 | Feature | Automated evidence | Limit |
 | --- | --- | --- |
+| Saved environments and last-selection startup restore | Real JSON, concurrent writers, near-limit saves, ACL denial, corrupt schemas, actual Save/Apply/Delete controls and fresh child processes | Explicit Save only; no credentials or live-operation settings |
+| Per-identity details and explicit availability refresh | Real local files/locks, replica expansion, native tabs/controls, full paths and read-only byte comparisons | AD/health/signatures are scan metadata; real remote sessions remain unverified |
+| Searchable audit history | Multi-month UTF8 CSVs, literal and UTC-date filters, sorting, full records, malformed/locked files, Dark theme and unchanged source hashes | Synchronous reads can take time; malformed files fail the entire query |
+| Feature navigation and restore/history identity links | Actual environment Apply, main Details button/double-click, nested history dialog, and real multi-user retire/restore audit queries | Legacy rows without SID use exact path fallback in details only |
 | Standard folder orders, flat names, container classes | Core and lifecycle suites scan synthetic directory layouts | Custom FSLogix naming policies need lab validation |
 | Sidecar/retired/superseded exclusions, zero/one/many users | Core, lifecycle, CLI and GUI suites inspect real local fixtures | UNC permissions and partial network outages need a file server |
 | Multi-root discovery and logical replica plans | Lifecycle suite mutates every recorded replica; CLI scans independent roots | No real Cloud Cache cache/resync traffic is generated |
@@ -52,6 +58,16 @@ Suite responsibilities:
 - `Test-FSLogixResetProfile.ps1`: CLI process and filesystem end-to-end workflows.
 - `Test-FSLogixProfileGUI.ps1`: native WinForms controls, dialogs and background scan.
 - `Test-FSLogixIntegrations.ps1`: local lock/signature checks and stubbed service adapters.
+- `Test-FSLogixEnvironments.ps1` / `Test-FSLogixEnvironmentGUI.ps1`: persistence,
+  validation, file access, safe application, and startup restore/override.
+- `Test-FSLogixAuditHistory.ps1` / `Test-FSLogixAuditHistoryGUI.ps1`: strict
+  read-only CSV search and native filters/sorting/error states.
+- `Test-FSLogixProfileDetails.ps1` / `Test-FSLogixProfileDetailsGUI.ps1`: identity
+  correlation, snapshot/refresh semantics, and actual native detail views.
+- `Test-FSLogixFeatureIntegration.ps1`: saved configuration to scan to selected
+  user details to audit search, including same-name SID separation.
+- `Assert-PortableBundle.ps1 -BundlePath <folder>`: additional CI smoke launch
+  of the relocated artifact, outside the numbered regression assertions.
 
 ## Required infrastructure validation before operational rollout
 
@@ -76,7 +92,8 @@ installed version, including large/paginated session inventories.
 ## CI and distribution
 
 `.github/workflows/windows-tests.yml` runs on pushes, pull requests, and manual
-dispatch. Only a passing test job packages the three scripts, docs and license
-as a commit-labelled portable artifact with build-info.json. No credentials,
+dispatch. Only a passing test job packages the three scripts, required Private/
+and UI/ sources, docs and license as a commit-labelled portable artifact with
+build-info.json. CI smoke-launches that relocated bundle before upload. No credentials,
 profile data or operator logs are packaged. Artifact creation is not deployment.
 The user explicitly requested no redeployment for this task.

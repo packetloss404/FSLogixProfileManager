@@ -169,7 +169,7 @@ if ($PSBoundParameters.ContainsKey('AuditRoot')) {
     Set-FSLogixAuditRoot -Path $AuditRoot
 }
 
-Write-Host "FSLogixResetProfile.ps1 - v0.8.0" -ForegroundColor Cyan
+Write-Host "FSLogixResetProfile.ps1 - v0.9.0" -ForegroundColor Cyan
 Write-Host ("ProfileRoot(s): {0}" -f ($roots -join '; '))
 Write-Host ("User filter  : {0}" -f ($User -join ', '))
 Write-Host ("LastUsedDays : {0}" -f $LastUsedDays)

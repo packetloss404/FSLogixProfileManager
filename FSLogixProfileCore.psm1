@@ -80,7 +80,7 @@ function Write-FSLogixLog {
     )
 
     if ($script:LogHandler) {
-        try { & $script:LogHandler $Message $Level } catch { }
+        try { $null = & $script:LogHandler $Message $Level } catch { }
         return
     }
 
@@ -732,6 +732,19 @@ function Get-FSLogixAuditRoot {
     return (Join-Path $env:ProgramData 'FSLogixProfileManager\Audit')
 }
 
+function Get-FSLogixAuditConfiguration {
+    [CmdletBinding()]
+    param()
+    return [PSCustomObject]@{ Path = (Get-FSLogixAuditRoot); IsExplicit = $script:AuditRootIsExplicit }
+}
+
+function Reset-FSLogixAuditRoot {
+    [CmdletBinding()]
+    param()
+    $script:AuditRoot = $null
+    $script:AuditRootIsExplicit = $false
+}
+
 function Write-FSLogixAudit {
     <#
     .SYNOPSIS
@@ -877,6 +890,13 @@ function Test-FSLogixHorizonConnected {
     [CmdletBinding()]
     param()
     return ($null -ne $script:HorizonConnection)
+}
+
+function Get-FSLogixHorizonServer {
+    [CmdletBinding()]
+    param()
+    if ($script:HorizonConnection) { return [string]$script:HorizonConnection.Server }
+    return $null
 }
 
 function Get-FSLogixHorizonSession {
@@ -1713,7 +1733,10 @@ function Restore-FSLogixProfileBatch {
                 if (Test-Path -LiteralPath $displaceTo) { throw "Displacement target already exists: $displaceTo" }
             }
             if ($plan.LivePath -contains $livePath) { throw "Multiple retired containers target $livePath. Select one retirement batch." }
-            $plan += [PSCustomObject]@{ RetiredPath = $file.FullName; LivePath = $livePath; DisplaceTo = $displaceTo; SizeGB = $item.SizeGB; DidDisplace = $false; DidRestore = $false }
+            $identity = Resolve-FSLogixIdentity -FolderLeaf (Split-Path (Split-Path -Parent $livePath) -Leaf) -FileName (Split-Path -Leaf $livePath)
+            $auditUser = if ($info.UserName) { $info.UserName } elseif ($identity.Source -ne 'Unresolved') { $identity.UserName } else { $UserName }
+            $auditSid = if ($info.Sid) { $info.Sid } elseif ($identity.Sid) { $identity.Sid } else { $Sid }
+            $plan += [PSCustomObject]@{ RetiredPath = $file.FullName; LivePath = $livePath; DisplaceTo = $displaceTo; SizeGB = $item.SizeGB; DidDisplace = $false; DidRestore = $false; TargetUser = $auditUser; TargetSid = $auditSid }
         } catch {
             $result.Aborted = $true
             $result.AbortReason = $_.Exception.Message
@@ -1724,7 +1747,7 @@ function Restore-FSLogixProfileBatch {
     try {
         # Audit all intents before the first mutation. Required audit outages fail closed.
         foreach ($step in $plan) {
-            Write-FSLogixAudit -Critical -Record @{ Action = 'RESTORE'; Mode = $mode; Reason = $Reason; TargetUser = $UserName; TargetSid = $Sid; SourcePath = $step.RetiredPath; DestPath = $step.LivePath; Result = 'STARTED' }
+            Write-FSLogixAudit -Critical -Record @{ Action = 'RESTORE'; Mode = $mode; Reason = $Reason; TargetUser = $step.TargetUser; TargetSid = $step.TargetSid; SourcePath = $step.RetiredPath; DestPath = $step.LivePath; Result = 'STARTED' }
         }
         foreach ($step in $plan) {
             [void][IO.Directory]::CreateDirectory((Split-Path -Parent $step.LivePath))
@@ -1732,13 +1755,13 @@ function Restore-FSLogixProfileBatch {
                 [IO.File]::Move($step.LivePath, $step.DisplaceTo)
                 $step.DidDisplace = $true
                 $result.Displaced++
-                Write-FSLogixAudit -Critical -Record @{ Action = 'RESTORE-DISPLACE'; Mode = $mode; Reason = $Reason; TargetUser = $UserName; TargetSid = $Sid; SourcePath = $step.LivePath; DestPath = $step.DisplaceTo; Result = 'OK' }
+                Write-FSLogixAudit -Critical -Record @{ Action = 'RESTORE-DISPLACE'; Mode = $mode; Reason = $Reason; TargetUser = $step.TargetUser; TargetSid = $step.TargetSid; SourcePath = $step.LivePath; DestPath = $step.DisplaceTo; Result = 'OK' }
             }
             [IO.File]::Move($step.RetiredPath, $step.LivePath)
             $step.DidRestore = $true
             $result.Restored++
             Write-FSLogixLog "Restored $($step.RetiredPath) -> $($step.LivePath)" 'INFO'
-            Write-FSLogixAudit -Critical -Record @{ Action = 'RESTORE'; Mode = $mode; Reason = $Reason; TargetUser = $UserName; TargetSid = $Sid; SourcePath = $step.RetiredPath; DestPath = $step.LivePath; SizeGB = $step.SizeGB; Result = 'OK' }
+            Write-FSLogixAudit -Critical -Record @{ Action = 'RESTORE'; Mode = $mode; Reason = $Reason; TargetUser = $step.TargetUser; TargetSid = $step.TargetSid; SourcePath = $step.RetiredPath; DestPath = $step.LivePath; SizeGB = $step.SizeGB; Result = 'OK' }
         }
     } catch {
         $result.Failed++
@@ -1751,7 +1774,7 @@ function Restore-FSLogixProfileBatch {
             try {
                 if ($step.DidRestore) { [IO.File]::Move($step.LivePath, $step.RetiredPath); $result.Restored-- }
                 if ($step.DidDisplace) { [IO.File]::Move($step.DisplaceTo, $step.LivePath); $result.Displaced-- }
-                Write-FSLogixAudit -Record @{ Action = 'RESTORE-ROLLBACK'; Mode = $mode; Reason = $Reason; TargetUser = $UserName; SourcePath = $step.LivePath; DestPath = $step.RetiredPath; Result = 'OK' }
+                Write-FSLogixAudit -Record @{ Action = 'RESTORE-ROLLBACK'; Mode = $mode; Reason = $Reason; TargetUser = $step.TargetUser; TargetSid = $step.TargetSid; SourcePath = $step.LivePath; DestPath = $step.RetiredPath; Result = 'OK' }
             } catch { $result.Errors += "Rollback failed: $($_.Exception.Message)" }
         }
     }
@@ -1779,7 +1802,8 @@ function Get-FSLogixRetiredContainer {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string[]]$ProfileRoots,
-        [int]$OlderThanDays = 0
+        [int]$OlderThanDays = 0,
+        [switch]$ErrorOnIncomplete
     )
 
     $now     = Get-Date
@@ -1787,10 +1811,15 @@ function Get-FSLogixRetiredContainer {
 
     foreach ($root in $ProfileRoots) {
         $root = "$root".Trim()
-        if ([string]::IsNullOrWhiteSpace($root) -or -not (Test-Path -LiteralPath $root)) { continue }
+        if ([string]::IsNullOrWhiteSpace($root) -or -not (Test-Path -LiteralPath $root -PathType Container)) {
+            if ($ErrorOnIncomplete) { throw "Retired-container root is unavailable: $root. Report is incomplete." }
+            continue
+        }
 
-        $files = @(Get-ChildItem -LiteralPath $root -Recurse -File -Filter *.vhd* -ErrorAction SilentlyContinue |
+        $reportErrors = @()
+        $files = @(Get-ChildItem -LiteralPath $root -Recurse -File -Filter *.vhd* -ErrorAction SilentlyContinue -ErrorVariable +reportErrors |
                    Where-Object { $script:ContainerExtensions -contains $_.Extension.ToLowerInvariant() })
+        if ($ErrorOnIncomplete -and $reportErrors.Count -gt 0) { throw "Retired-container report is incomplete: $($reportErrors.Count) path(s) under $root could not be read." }
 
         foreach ($file in $files) {
             $retired = Test-FSLogixRetiredName -FileName $file.Name
@@ -1925,6 +1954,13 @@ function Remove-FSLogixRetiredContainer {
     return $result
 }
 
+# Feature data helpers share this module's state and stay independent of WinForms.
+foreach ($featureSource in @('Environments.ps1', 'AuditHistory.ps1', 'ProfileDetails.ps1')) {
+    $featurePath = Join-Path (Join-Path $PSScriptRoot 'Private') $featureSource
+    if (-not (Test-Path -LiteralPath $featurePath -PathType Leaf)) { throw "Required core feature file is missing: $featurePath. Copy the Private directory with the scripts." }
+    . $featurePath
+}
+
 Export-ModuleMember -Function @(
     'Set-FSLogixLogHandler'
     'Write-FSLogixLog'
@@ -1948,10 +1984,13 @@ Export-ModuleMember -Function @(
     'Get-FSLogixLdapEscapedValue'
     'Set-FSLogixAuditRoot'
     'Get-FSLogixAuditRoot'
+    'Get-FSLogixAuditConfiguration'
+    'Reset-FSLogixAuditRoot'
     'Write-FSLogixAudit'
     'Connect-FSLogixHorizon'
     'Disconnect-FSLogixHorizon'
     'Test-FSLogixHorizonConnected'
+    'Get-FSLogixHorizonServer'
     'Get-FSLogixHorizonSession'
     'Stop-FSLogixHorizonSession'
     'Get-FSLogixProfiles'
@@ -1961,4 +2000,12 @@ Export-ModuleMember -Function @(
     'Restore-FSLogixProfileBatch'
     'Get-FSLogixRetiredContainer'
     'Remove-FSLogixRetiredContainer'
+    'Get-FSLogixEnvironmentStorePath'
+    'ConvertTo-FSLogixEnvironmentSettings'
+    'Get-FSLogixEnvironmentStore'
+    'Save-FSLogixEnvironment'
+    'Remove-FSLogixEnvironment'
+    'Set-FSLogixActiveEnvironment'
+    'Get-FSLogixAuditHistory'
+    'Get-FSLogixProfileDetails'
 )

@@ -1,4 +1,4 @@
-# Guidance for coding agents
+﻿# Guidance for coding agents
 
 ## Architecture and runtime
 
@@ -6,7 +6,7 @@ This is a Windows PowerShell 5.1 WinForms application and CLI, not a web app.
 FSLogixProfileCore.psm1 owns discovery, naming, filters, health, AD, SMB probes,
 Horizon, audit, retirement, restoration, and gated purge. It has no WinForms
 dependency. FSLogixProfileGUI.ps1 and FSLogixResetProfile.ps1 are the hosts.
-Keep core behavior in the module. Add public functions to Export-ModuleMember.
+Keep core behavior in the module. Private/*.ps1 contains feature data helpers dot-sourced into that module; UI/*.ps1 contains feature dialogs dot-sourced by the GUI. Add public data functions to Export-ModuleMember. These directories are required runtime files and must ship with the scripts.
 
 Use Windows PowerShell 5.1 to verify compatibility. The GUI requires STA:
 
@@ -72,3 +72,24 @@ need infrastructure validation. No installer or automated redeploy is configured
 README.md is the current operator guide, BACKLOG.md records remaining work,
 and CHANGELOG.md records implementation changes. Keep them consistent with
 executed evidence; old handoff claims are not current acceptance criteria.
+
+## Saved environments, details and history
+
+Environment storage is schema-versioned per-user JSON, overridden with GUI
+-EnvironmentStorePath in tests. Always isolate this path in native tests.
+Capture only whitelisted preferences, never credentials/tokens/tickets/TLS
+bypass or live-operation choices. Apply must clear rows, invalidate the scan,
+disconnect Horizon and restore safe defaults. Normal launch restores last
+selection; an explicit -DefaultProfileRoot skips that startup restoration.
+
+Audit search is strictly read-only, uses inclusive UTC dates and literal text
+filters, and fails visibly on malformed/unreadable source files. Details prefer
+exact SID and only use exact path fallback for old rows without SID. Never
+combine different known SIDs because usernames happen to match. Detail opening
+does not probe SMB locks/Horizon until Refresh availability is requested.
+
+Restore audit rows must carry per-file identity in multi-user batches. Logging
+callbacks must never emit host return values into the core success stream.
+Keep feature data free of WinForms. Extend native and cross-feature tests when
+changing dialogs, startup precedence, safety state or identity correlation.
+CI smoke-launches the relocated portable artifact, including Private/ and UI/.

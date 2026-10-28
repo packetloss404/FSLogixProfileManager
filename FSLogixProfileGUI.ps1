@@ -1,6 +1,6 @@
 <#
 FSLogix Profile Manager - Horizon Instant Clones
-Version: 0.8.0
+Version: 0.9.0
 
 Environment:
   Root: \\fml-fslogix\FSLogixUserProfiles (supports multiple paths separated by semicolon)
@@ -20,11 +20,14 @@ is the WinForms host.
 
 param(
     [string]$DefaultProfileRoot = "\\fml-fslogix\FSLogixUserProfiles",
+    # Override per-user saved configuration storage (useful for portable/test hosts).
+    [string]$EnvironmentStorePath,
     # Build real controls without entering the main modal loop (for host/test use).
     [switch]$InitializeOnly
 )
 
-$appVersion = "0.8.0"
+$appVersion = "0.9.0"
+$script:HorizonServerHint = ''
 
 if ([Threading.Thread]::CurrentThread.ApartmentState -ne 'STA') {
     throw 'The GUI requires STA mode. Launch powershell.exe -STA -File .\FSLogixProfileGUI.ps1.'
@@ -65,7 +68,7 @@ function Add-LogMessage {
 
     if ($script:txtLog -and $script:txtLog.IsHandleCreated) {
         try {
-            $script:txtLog.Invoke([Action]{
+            [void]$script:txtLog.Invoke([Action]{
                 $script:txtLog.AppendText("$entry`r`n")
                 $script:txtLog.SelectionStart = $script:txtLog.TextLength
                 $script:txtLog.ScrollToCaret()
@@ -88,7 +91,7 @@ $script:LogHandler = {
     if ($Level -eq 'PROGRESS') {
         $lbl = $script:lblStatus
         if ($lbl -and $lbl.IsHandleCreated) {
-            try { $lbl.Invoke([Action]{ $script:lblStatus.Text = $Message }) } catch { }
+            try { [void]$lbl.Invoke([Action]{ $script:lblStatus.Text = $Message }) } catch { }
         }
         return
     }
@@ -357,6 +360,7 @@ function Show-HorizonConnectDialog {
     $txtServer = New-Object System.Windows.Forms.TextBox
     $txtServer.Location = New-Object System.Drawing.Point(110, 13)
     $txtServer.Size = New-Object System.Drawing.Size(300, 22)
+    $txtServer.Text = $script:HorizonServerHint
     $dlg.Controls.Add($txtServer)
 
     $lblUser = New-Object System.Windows.Forms.Label
@@ -436,6 +440,7 @@ function Show-HorizonConnectDialog {
 
     try {
         Connect-FSLogixHorizon -Server $txtServer.Text -Credential $cred -Domain $domain -SkipCertificateCheck:$chkSkipCert.Checked
+        $script:HorizonServerHint = $txtServer.Text.Trim()
         Add-LogMessage "Connected to Horizon: $txtServer.Text" "INFO"
         [void](Show-FSLogixMessage -Text "Connected to $($txtServer.Text)." -Caption Horizon -Icon Information)
     } catch {
@@ -1209,13 +1214,23 @@ $lblReasonHint.ForeColor = [System.Drawing.Color]::Gray
 $lblReasonHint.Font = New-Object System.Drawing.Font("Segoe UI", 7)
 $form.Controls.Add($lblReasonHint)
 
+# --- Environment and inspection tools ---
+$script:FeatureToolbar = New-Object System.Windows.Forms.FlowLayoutPanel
+$script:FeatureToolbar.Name = 'FeatureToolbar'
+$script:FeatureToolbar.Location = New-Object System.Drawing.Point(10, 110)
+$script:FeatureToolbar.Size = New-Object System.Drawing.Size(1160, 34)
+$script:FeatureToolbar.Anchor = 'Top,Left,Right'
+$script:FeatureToolbar.WrapContents = $false
+$script:FeatureToolbar.AutoScroll = $true
+$form.Controls.Add($script:FeatureToolbar)
+
 # --- SplitContainer for Grid + Log Panel ---
 
 $splitContainer = New-Object System.Windows.Forms.SplitContainer
-$splitContainer.Location = New-Object System.Drawing.Point(10, 110)
-$splitContainer.Size = New-Object System.Drawing.Size(1160, 595)
+$splitContainer.Location = New-Object System.Drawing.Point(10, 150)
+$splitContainer.Size = New-Object System.Drawing.Size(1160, 555)
 $splitContainer.Orientation = "Horizontal"
-$splitContainer.SplitterDistance = 470
+$splitContainer.SplitterDistance = 430
 $splitContainer.Panel1MinSize = 200
 $splitContainer.Panel2MinSize = 80
 $splitContainer.Anchor = "Top,Left,Right,Bottom"
@@ -1985,7 +2000,41 @@ $btnRetired.Add_Click({
 # --------------------------------------------------------------------
 #  Apply initial theme and start
 # --------------------------------------------------------------------
+foreach ($featureUI in @('Environments.ps1', 'AuditHistory.ps1', 'ProfileDetails.ps1')) {
+    $featureUIPath = Join-Path (Join-Path $PSScriptRoot 'UI') $featureUI
+    if (-not (Test-Path -LiteralPath $featureUIPath -PathType Leaf)) { throw "Required GUI feature file is missing: $featureUIPath. Copy the UI directory with the scripts." }
+    . $featureUIPath
+}
 Apply-Theme "Light"
+Initialize-FSLogixEnvironmentUI -StorePath $EnvironmentStorePath -RestoreActive:(-not $PSBoundParameters.ContainsKey('DefaultProfileRoot'))
+
+$btnDetails = New-Object System.Windows.Forms.Button
+$btnDetails.Name = 'ProfileDetailsButton'
+$btnDetails.Text = 'User details...'
+$btnDetails.Width = 105
+$btnDetails.Height = 26
+$btnDetails.Enabled = $false
+$script:FeatureToolbar.Controls.Add($btnDetails)
+$btnDetails.Add_Click({
+    if ($grid.SelectedRows.Count -eq 1 -and $grid.SelectedRows[0].Tag) {
+        Show-FSLogixProfileDetailsDialog -ProfileObject $grid.SelectedRows[0].Tag -AuditRoot (Get-FSLogixAuditRoot)
+    }
+})
+$grid.Add_SelectionChanged({ $btnDetails.Enabled = ($grid.SelectedRows.Count -eq 1 -and $null -ne $grid.SelectedRows[0].Tag) })
+$grid.Add_CellDoubleClick({
+    param($sender, $eventArgs)
+    if ($eventArgs.RowIndex -ge 0 -and $grid.Rows[$eventArgs.RowIndex].Tag) {
+        Show-FSLogixProfileDetailsDialog -ProfileObject $grid.Rows[$eventArgs.RowIndex].Tag -AuditRoot (Get-FSLogixAuditRoot)
+    }
+})
+$btnAuditHistory = New-Object System.Windows.Forms.Button
+$btnAuditHistory.Name = 'AuditHistoryButton'
+$btnAuditHistory.Text = 'Audit history...'
+$btnAuditHistory.Width = 105
+$btnAuditHistory.Height = 26
+$script:FeatureToolbar.Controls.Add($btnAuditHistory)
+$btnAuditHistory.Add_Click({ Show-FSLogixAuditHistoryDialog -AuditRoot (Get-FSLogixAuditRoot) })
+Apply-Theme $script:CurrentTheme
 
 Add-LogMessage "FSLogix Profile Manager v$appVersion started" "INFO"
 Add-LogMessage "Ready. Enter profile root path(s) and click 'Load Profiles'" "INFO"

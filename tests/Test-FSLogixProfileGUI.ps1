@@ -39,7 +39,7 @@ try {
     [void](New-TestContainer 'bob' 1002 'Profile_bob.vhdx')
     [void](New-TestContainer 'bob' 1003 'Profile_bob.vhdx')
     [void](New-TestContainer 'bob' 1004 'Profile_bob.vhdx')
-    . (Join-Path (Split-Path -Parent $PSScriptRoot) 'FSLogixProfileGUI.ps1') -DefaultProfileRoot $testRoot -InitializeOnly
+    . (Join-Path (Split-Path -Parent $PSScriptRoot) 'FSLogixProfileGUI.ps1') -DefaultProfileRoot $testRoot -EnvironmentStorePath (Join-Path $testRoot 'environments.json') -InitializeOnly
 
     # The app still constructs and shows real controls. Keep its window out of
     # the operator's way while PerformClick raises the production event handlers.
