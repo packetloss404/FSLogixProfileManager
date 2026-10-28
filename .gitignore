@@ -9,3 +9,7 @@ desktop.ini
 *.swp
 .vscode/
 .idea/
+
+# Verified CI/local distribution output
+dist/
+artifacts/

@@ -1,0 +1,38 @@
+name: Windows tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: windows-2022
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Windows PowerShell 5.1 native and CLI tests
+        shell: powershell
+        run: .\tests\Invoke-Tests.ps1
+      - name: Prepare verified portable scripts
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Path dist | Out-Null
+          Copy-Item FSLogixProfileCore.psm1,FSLogixProfileGUI.ps1,FSLogixResetProfile.ps1,README.md,CHANGELOG.md,LICENSE -Destination dist
+          Copy-Item -Recurse docs -Destination dist
+          @{
+            Commit = '${{ github.sha }}'
+            Run = '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}'
+            Runtime = 'Windows PowerShell 5.1; WinForms requires STA'
+          } | ConvertTo-Json | Set-Content dist\build-info.json -Encoding UTF8
+      - uses: actions/upload-artifact@v7
+        with:
+          name: FSLogixProfileManager-${{ github.sha }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30

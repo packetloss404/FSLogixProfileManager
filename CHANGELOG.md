@@ -1,88 +1,47 @@
-# FSLogix Profile Manager – Changelog
+﻿# FSLogix Profile Manager – Changelog
 
 ## Unreleased
 
-Groundwork for v0.8.0. The GUI and CLI now import `FSLogixProfileCore.psm1`; the
-duplicated local copies of scan/filter/retire/in-use/AD/health logic are gone.
+October 2026 verification and correctness fixes (development version 0.8.0).
 
-**Wired into the GUI (`FSLogixProfileGUI.ps1`):**
-
-- LIVE / SIMULATION banner on the preview dialog, with operator, user count,
-  scope, in-use check and Horizon status.
-- Cancel is now the AcceptButton on the preview; auto-select of row 0 after
-  a load is cleared so the empty-selection guard is no longer dead.
-- Proportionate confirmation: lists up to 5 users + "+N more", shows the
-  container count, defaults to No, and above a threshold requires the
-  operator to type the container count.
-- Result counts (renamed / in-use / exists / missing / failed / aborted)
-  come from the module's structured return and render into the status bar
-  and a result dialog.
-- The Reset button is red and reads "Reset Profile - LIVE" whenever
-  WhatIf is off; restored when WhatIf comes back on. Survives rescan and
-  theme changes.
-- WhatIf runs no longer trigger a second full-share freeze.
-- The scan runs in a background runspace with a Cancel button, draining
-  progress through a ConcurrentQueue via a WinForms Timer on the UI
-  thread. The UI no longer ghosts during a large share scan.
-- Reason / Ticket text box, required for any live run (WhatIf is still
-  allowed without one). The reason is written to the audit log on every
-  renamed row.
-- AD Last Logon column surfaces `lastLogonTimestamp`, with a parallel
-  "AD last logon > N days" filter plumbed through `Select-FSLogixProfile
-  -ADLastLogonDays`. The on-disk age filter still works the same way.
-- Horizon connect dialog (server / user / domain / password / optional
-  skip-cert for labs). Connection state surfaces in the preview banner.
-- Settings dialog for the audit root, with a "use default" jump back to
-  `%ProgramData%` for homelabs. An explicitly-set central path means a
-  failed audit write aborts the operation.
-- Retired-containers dialog with batch Restore and gated Purge. Last-copy
-  rows are tinted; the dialog auto-adds `-AllowLastCopy` and/or
-  `-IncludeUndated` only when the selection actually needs them.
-- "Move to retired" checkbox (default on): retired files land under
-  `<root>\_retired\<user>\<batch-stamp>\` instead of in the user's
-  writable directory. They stop counting against the user's FSRM quota
-  and fall outside the user's ACL scope.
-- Sort glyph persists across filter/rescan; Status and SIDs sort by the
-  displayed text, not by item count; the "Used GB" column is renamed
-  to "Size (GB)"; the log panel no longer dies at ~32 KB
-  (`MaxLength = 0`); the preview form is disposed; CSV exports the full
-  SID list and respects the user's column reorder.
-
-**Wired into the CLI (`FSLogixResetProfile.ps1`):**
-
-- `[CmdletBinding(SupportsShouldProcess, ConfirmImpact='High')]` replaces
-  the hand-rolled `-WhatIf`. `-WhatIf` and `-Confirm` work the way
-  every other PS advanced function does.
-- A bare call with no filter is refused outright. `-User`, `-LastUsedDays`
-  or an explicit `-All` is required.
-- In-use checking defaults to `$true`. `-CheckInUse:$false` opts out.
-- `-OnlyOdfc` and `-OnlyProfile` collapse into `-Scope` (All / Office /
-  Profile).
-- `-Force` passes through to the module's retire (allow unresolved
-  identities).
-- Multi-root via `-ProfileRoots` as a parameter set, or `-ProfileRoot`
-  that splits on `;`.
-
-**Module (`FSLogixProfileCore.psm1`):**
-
-- `Rename-FSLogixProfileObject` and `Get-FSLogixRetirePlan` now accept a
-  `-MoveToRetired` switch that retires into `<root>\_retired\<user>\<stamp>\`.
-
-**Tests:**
-
-- `tests/Test-FSLogixProfileCore.ps1` — 39 checks. Added coverage for
-  `Rename-FSLogixProfileObject` under `-WhatIf` and under `-MoveToRetired`.
-- `tests/Test-FSLogixResetProfile.ps1` (new) — 13 CLI smoke tests for the
-  safety contract: bare-call refusal, `-All` opt-in, `-LastUsedDays`,
-  `-User`, `WhatIf` routing through `SupportsShouldProcess`, unknown
-  user, help text.
-
-**New: `.gitignore`** — keeps `FSLogix_Rename_*.log` and exported CSVs out
-of the repo.
-
-Also: absorbed `FSLogixResetProfile.ps1` into this repo (`5d0d08b`) and
-removed leftover DEBUG MAP scaffolding from both scripts (`21ba003`) —
-neither was recorded here at the time.
+- Added Windows PowerShell 5.1 CI on push/PR, an isolated timeout-bounded test
+  runner, real native WinForms tests, CLI subprocess tests, filesystem lifecycle
+  tests, and explicitly stubbed service-adapter tests. CI packages a portable
+  script artifact only after passing; no deployment is configured or performed.
+- Local verification passes 339 checks across core (41), lifecycle (83), native
+  GUI (87), CLI (81), and adapter (47) suites. External systems remain unverified.
+- Fixed nested-array return handling in scan, health, plan, preview and retired
+  paths. Empty and single-user results now behave correctly in both hosts.
+- Fixed CLI wildcard matching and real WhatIf planning/logs. Live runs now require
+  -Reason, support -AuditRoot, and default to MoveToRetired and AllOrNothing.
+  Missing/failed/aborted actions return nonzero. Bare calls are refused before
+  root access; unavailable roots and blank filters are rejected.
+- Retirement now expands every recorded physical Cloud Cache replica, checks the
+  batch before changes, and attempts rollback after failures. Audit intent is
+  written before mutation; required audit failure aborts or triggers rollback.
+- Managed retirements keep .restore.json original-path metadata. Restore validates
+  those relative paths, preflights the selection, preserves replacement live files,
+  and attempts batch rollback after failures. Older managed retirements without
+  metadata require manual recovery. Superseded containers stay out of live scans.
+- Purge revalidates current file type, retired suffix, date, original live sibling,
+  and last-copy state rather than trusting report fields. The configurable
+  retention floor cannot be lowered below 90 days.
+- Fixed GUI CSV display order, sort persistence, selection identity, retired dialog
+  headers and batch restore, mutually exclusive scope controls, and scan-cancel
+  cleanup. Preview and confirmation retain safe defaults. Connected GUI retirement
+  requires the Horizon session gate and uses per-identity all-or-nothing handling.
+- Horizon requests restore certificate-validation callbacks after success/failure;
+  lab bypass follows the chosen connection. Failed or tokenless reconnects clear
+  stale connection state; logoff IDs are URI-escaped.
+- Required Horizon checks reject malformed/null inventories and recognize bare,
+  domain-qualified and UPN usernames. SMB probes keep server results separate
+  and reject mixed-server public requests. GUI/CLI discovery fails closed on
+  missing roots and partial enumeration; stale GUI results cannot enable Reset.
+- Rewrote README, backlog, agent guidance and handoff to distinguish implemented
+  behavior from verified behavior. Removed claims of multi-SID username merging,
+  automatic ACL/quota protection, automatic policy/metadata reads, and completed
+  production integration validation. See docs/VERIFICATION.md for remaining lab
+  checks for AD, SMB, Hyper-V, Horizon and Cloud Cache.
 
 ## v0.7.0
 

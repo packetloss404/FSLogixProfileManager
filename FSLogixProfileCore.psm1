@@ -201,7 +201,7 @@ function Get-FSLogixRetireTargetName {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string]$FileName,
-        [Parameter(Mandatory = $true)][string]$BatchStamp
+        [Parameter(Mandatory = $true)][ValidatePattern('^\d{8}-\d{6}$')][string]$BatchStamp
     )
     $base = [System.IO.Path]::GetFileNameWithoutExtension($FileName)
     $ext  = [System.IO.Path]::GetExtension($FileName)
@@ -323,6 +323,14 @@ function Get-FSLogixOpenHandle {
         else { return $null }
     }
 
+    # This result can only be authoritative for the server actually queried.
+    foreach ($target in $Path) {
+        if ($target -notmatch '^\\\\(?<server>[^\\]+)\\' -or $Matches['server'] -ne $FileServer) {
+            Write-FSLogixLog 'SMB handle requests must target one UNC server; falling back to lock probing.' 'WARN'
+            return $null
+        }
+    }
+
     if ($script:SmbProbeFailed.ContainsKey($FileServer)) { return $null }
 
     try {
@@ -346,7 +354,7 @@ function Get-FSLogixOpenHandle {
         $leaf   = Split-Path -Leaf $target
         $parent = Split-Path -Leaf (Split-Path -Parent $target)
         # Get-SmbOpenFile reports the server-local path, so match on the tail.
-        $tail   = '*\{0}\{1}' -f $parent, $leaf
+        $tail   = '*\{0}\{1}' -f [System.Management.Automation.WildcardPattern]::Escape($parent), [System.Management.Automation.WildcardPattern]::Escape($leaf)
         foreach ($handle in ($open | Where-Object { $_.Path -like $tail })) {
             $results += [PSCustomObject]@{
                 Path           = $target
@@ -767,7 +775,7 @@ function Write-FSLogixAudit {
             [void](New-Item -Path $root -ItemType Directory -Force -ErrorAction Stop)
         }
         $mutex = New-Object System.Threading.Mutex($false, 'Global\FSLogixProfileManagerAudit')
-        [void]$mutex.WaitOne(10000)
+        if (-not $mutex.WaitOne(10000)) { throw 'Timed out waiting for the audit writer.' }
         [PSCustomObject]$row | Export-Csv -LiteralPath $file -NoTypeInformation -Encoding UTF8 -Append -ErrorAction Stop
     } catch {
         $message = "Audit write failed ($file): $($_.Exception.Message)"
@@ -784,6 +792,28 @@ function Write-FSLogixAudit {
 # --------------------------------------------------------------------
 #  Horizon session gate (optional)
 # --------------------------------------------------------------------
+
+function Invoke-FSLogixHorizonRequest {
+    [CmdletBinding()]
+    param([hashtable]$Request, [switch]$SkipCertificateCheck)
+
+    # Certificate bypass is a per-connection lab option, never process-wide state.
+    $previousCallback = [System.Net.ServicePointManager]::ServerCertificateValidationCallback
+    try {
+        if ($SkipCertificateCheck) {
+            if ((Get-Command Invoke-RestMethod).Parameters.ContainsKey('SkipCertificateCheck')) {
+                $Request.SkipCertificateCheck = $true
+            } else {
+                [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
+            }
+        }
+        $response = Invoke-RestMethod @Request
+        # Preserve [] as an authoritative empty result, distinct from JSON null.
+        return ,$response
+    } finally {
+        [System.Net.ServicePointManager]::ServerCertificateValidationCallback = $previousCallback
+    }
+}
 
 function Connect-FSLogixHorizon {
     <#
@@ -806,10 +836,6 @@ function Connect-FSLogixHorizon {
     [System.Net.ServicePointManager]::SecurityProtocol = `
         [System.Net.ServicePointManager]::SecurityProtocol -bor [System.Net.SecurityProtocolType]::Tls12
 
-    if ($SkipCertificateCheck) {
-        [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
-    }
-
     $user = $Credential.UserName
     if (-not $Domain -and $user -match '^(?<domain>[^\\]+)\\(?<name>.+)$') {
         $Domain = $Matches['domain']
@@ -822,11 +848,20 @@ function Connect-FSLogixHorizon {
         domain   = $Domain
     } | ConvertTo-Json
 
-    $response = Invoke-RestMethod -Method Post -Uri "https://$Server/rest/login" -Body $body -ContentType 'application/json' -ErrorAction Stop
+    # A failed reconnect must not leave an old server looking connected.
+    $script:HorizonConnection = $null
+    $response = Invoke-FSLogixHorizonRequest -Request @{
+        Method = 'Post'; Uri = "https://$Server/rest/login"; Body = $body
+        ContentType = 'application/json'; ErrorAction = 'Stop'
+    } -SkipCertificateCheck:$SkipCertificateCheck
+    if ([string]::IsNullOrWhiteSpace($response.access_token)) {
+        throw 'Horizon login did not return an access token.'
+    }
 
     $script:HorizonConnection = [PSCustomObject]@{
         Server  = $Server
         Headers = @{ Authorization = "Bearer $($response.access_token)" }
+        SkipCertificateCheck = [bool]$SkipCertificateCheck
     }
     Write-FSLogixLog "Connected to Horizon Connection Server $Server." 'INFO'
     return $script:HorizonConnection
@@ -858,10 +893,19 @@ function Get-FSLogixHorizonSession {
     if (-not $script:HorizonConnection) { return $null }
 
     try {
-        $sessions = Invoke-RestMethod -Method Get `
-            -Uri "https://$($script:HorizonConnection.Server)/rest/inventory/v1/sessions" `
-            -Headers $script:HorizonConnection.Headers -ErrorAction Stop
-        return , @($sessions | Where-Object { $_.user_name -match ('\\' + [regex]::Escape($UserName) + '$') })
+        $sessions = Invoke-FSLogixHorizonRequest -Request @{
+            Method = 'Get'; Uri = "https://$($script:HorizonConnection.Server)/rest/inventory/v1/sessions"
+            Headers = $script:HorizonConnection.Headers; ErrorAction = 'Stop'
+        } -SkipCertificateCheck:$script:HorizonConnection.SkipCertificateCheck
+        if ($null -eq $sessions) { throw 'Horizon returned no session inventory.' }
+        foreach ($session in @($sessions)) {
+            if ($session.user_name -isnot [string] -or [string]::IsNullOrWhiteSpace($session.user_name)) {
+                throw 'Unrecognized Horizon session response. Check API compatibility before retirement.'
+            }
+        }
+        # Match domain-qualified, bare and UPN-style names conservatively.
+        $userPattern = '(^|\\)' + [regex]::Escape($UserName) + '(@[^@\\]+)?$'
+        return , @($sessions | Where-Object { $_.user_name -match $userPattern })
     } catch {
         Write-FSLogixLog "Horizon session query failed for '$UserName': $($_.Exception.Message)" 'WARN'
         return $null
@@ -880,9 +924,11 @@ function Stop-FSLogixHorizonSession {
     if (-not $script:HorizonConnection) { throw 'Not connected to a Horizon Connection Server.' }
 
     if ($PSCmdlet.ShouldProcess($SessionId, 'Log off Horizon session')) {
-        Invoke-RestMethod -Method Post `
-            -Uri "https://$($script:HorizonConnection.Server)/rest/inventory/v1/sessions/$SessionId/logoff" `
-            -Headers $script:HorizonConnection.Headers -ErrorAction Stop
+        $encodedId = [uri]::EscapeDataString($SessionId)
+        Invoke-FSLogixHorizonRequest -Request @{
+            Method = 'Post'; Uri = "https://$($script:HorizonConnection.Server)/rest/inventory/v1/sessions/$encodedId/logoff"
+            Headers = $script:HorizonConnection.Headers; ErrorAction = 'Stop'
+        } -SkipCertificateCheck:$script:HorizonConnection.SkipCertificateCheck
         Write-FSLogixLog "Logged off Horizon session $SessionId." 'INFO'
     }
 }
@@ -890,6 +936,38 @@ function Stop-FSLogixHorizonSession {
 # --------------------------------------------------------------------
 #  Discovery
 # --------------------------------------------------------------------
+
+function Get-FSLogixRestoreInfo {
+    # Moved retirements carry a relative original path. Never trust a manifest to
+    # direct a restore outside the scanned root or back into the retirement tree.
+    param($File, [string]$Root)
+    $retired = Test-FSLogixRetiredName -FileName $File.Name
+    $rootPath = [IO.Path]::GetFullPath($Root).TrimEnd('\') + '\'
+    $retiredRoot = Join-Path $rootPath '_retired'
+    $isMoved = $File.FullName.StartsWith($retiredRoot + '\', [StringComparison]::OrdinalIgnoreCase)
+    $info = [PSCustomObject]@{ LivePath = $null; UserName = $null; Sid = $null; IsSafe = $false; IsMoved = $isMoved }
+    if (-not $retired) { return $info }
+    if (-not $isMoved) {
+        $info.LivePath = Join-Path $File.DirectoryName $retired.LiveName
+        $info.IsSafe = $true
+        return $info
+    }
+    $manifestPath = $File.FullName + '.restore.json'
+    if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) { return $info }
+    try {
+        $manifest = Get-Content -LiteralPath $manifestPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        if ([IO.Path]::IsPathRooted($manifest.OriginalRelativePath)) { return $info }
+        $candidate = [IO.Path]::GetFullPath((Join-Path $rootPath $manifest.OriginalRelativePath))
+        if (-not $candidate.StartsWith($rootPath, [StringComparison]::OrdinalIgnoreCase) -or
+            $candidate.StartsWith($retiredRoot + '\', [StringComparison]::OrdinalIgnoreCase) -or
+            [IO.Path]::GetFileName($candidate) -ne $retired.LiveName) { return $info }
+        $info.LivePath = $candidate
+        $info.UserName = $manifest.UserName
+        $info.Sid = $manifest.Sid
+        $info.IsSafe = $true
+    } catch { }
+    return $info
+}
 
 function Get-FSLogixProfiles {
     <#
@@ -915,6 +993,7 @@ function Get-FSLogixProfiles {
         [switch]$CheckOrphans,
         [switch]$ReadVhdMetadata,
         [switch]$CloudCacheMode,
+        [switch]$ErrorOnIncomplete,
         [double]$ConfiguredMaxSizeGB = 0,
         [double]$ConfiguredOfficeMaxSizeGB = 0,
         [int]$ProgressEvery = 250
@@ -931,7 +1010,8 @@ function Get-FSLogixProfiles {
         $root = "$root".Trim()
         if ([string]::IsNullOrWhiteSpace($root)) { continue }
 
-        if (-not (Test-Path -LiteralPath $root)) {
+        if (-not (Test-Path -LiteralPath $root -PathType Container)) {
+            if ($ErrorOnIncomplete) { throw "Profile root is unavailable: $root. Scan is incomplete; no actions should be taken." }
             Write-FSLogixLog "Profile root not found: $root" 'WARN'
             continue
         }
@@ -953,11 +1033,14 @@ function Get-FSLogixProfiles {
         }
         if ($rootErrors.Count -gt 0) {
             $scanErrors += $rootErrors
+            if ($ErrorOnIncomplete) { throw "Scan is incomplete: $($rootErrors.Count) path(s) under $root could not be read. No actions should be taken." }
             Write-FSLogixLog "$($rootErrors.Count) path(s) under $root could not be read (access denied or path too long) - results for this root are INCOMPLETE." 'ERROR'
         }
         Write-FSLogixLog "Found $($files.Count) container file(s) under $root." 'INFO'
 
         foreach ($file in $files) {
+            # Superseded containers are backups created by restore, never live targets.
+            if (Test-FSLogixSupersededName -FileName $file.Name) { continue }
             $fileCount++
             if ($ProgressEvery -gt 0 -and ($fileCount % $ProgressEvery) -eq 0) {
                 Write-FSLogixLog "Processed $fileCount container(s)..." 'PROGRESS'
@@ -965,6 +1048,12 @@ function Get-FSLogixProfiles {
 
             $folderLeaf = Split-Path $file.DirectoryName -Leaf
             $identity   = Resolve-FSLogixIdentity -FolderLeaf $folderLeaf -FileName $file.Name
+            if (Test-FSLogixRetiredName -FileName $file.Name) {
+                $restoreInfo = Get-FSLogixRestoreInfo -File $file -Root $root
+                if ($restoreInfo.UserName) {
+                    $identity = [PSCustomObject]@{ UserName = $restoreInfo.UserName; Sid = $restoreInfo.Sid; Source = 'RetirementManifest' }
+                }
+            }
 
             # Unresolved rows are keyed on the directory, never on a shared guessed name.
             # Keying them on the folder leaf let a flat share collapse every container in
@@ -999,6 +1088,8 @@ function Get-FSLogixProfiles {
             if (-not $userTable.ContainsKey($userKey)) {
                 $userTable[$userKey] = [PSCustomObject]@{
                     UserName           = $identity.UserName
+                    CloudCacheMode     = [bool]$CloudCacheMode
+                    ExpectedProfileRoots = @($ProfileRoots | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { [IO.Path]::GetFullPath($_.Trim()).TrimEnd('\') })
                     Sid                = $identity.Sid
                     IdentitySource     = $identity.Source
                     IsIdentityResolved = ($identity.Source -ne 'Unresolved')
@@ -1064,10 +1155,11 @@ function Get-FSLogixProfiles {
                 $entry.RetiredContainers += $container
                 $entry.RetiredSizeGB     += $sizeGB
                 [void]$entry.HealthIssues.Add('HAS_RETIRED')
+                if ($entry.ContainerCount -eq 0 -and $file.LastWriteTime -gt $entry.LastWriteTime) { $entry.LastWriteTime = $file.LastWriteTime }
                 continue
             }
 
-            $container.Issues = @(Get-FSLogixContainerHealth -Path $file.FullName -SizeGB $sizeGB -MaxSizeGB $maxSize -Signature $signature)
+            $container.Issues = Get-FSLogixContainerHealth -Path $file.FullName -SizeGB $sizeGB -MaxSizeGB $maxSize -Signature $signature
             foreach ($issue in $container.Issues) { [void]$entry.HealthIssues.Add($issue) }
 
             $entry.Containers += $container
@@ -1083,7 +1175,7 @@ function Get-FSLogixProfiles {
             if ($null -ne $maxSize -and ($null -eq $entry.MaxSizeGB -or $maxSize -gt $entry.MaxSizeGB)) {
                 $entry.MaxSizeGB = $maxSize
             }
-            if ($file.LastWriteTime -gt $entry.LastWriteTime) { $entry.LastWriteTime = $file.LastWriteTime }
+            if ($entry.ContainerCount -eq 1 -or $file.LastWriteTime -gt $entry.LastWriteTime) { $entry.LastWriteTime = $file.LastWriteTime }
         }
     }
 
@@ -1195,7 +1287,7 @@ function Get-FSLogixRetirePlan {
     param(
         [Parameter(Mandatory = $true)]$ProfileObject,
         [ValidateSet('All', 'Office', 'Profile')][string]$Scope = 'All',
-        [string]$BatchStamp,
+        [ValidatePattern('^\d{8}-\d{6}$')][string]$BatchStamp,
         [switch]$CheckInUse,
         [switch]$MoveToRetired
     )
@@ -1208,20 +1300,42 @@ function Get-FSLogixRetirePlan {
         default   { @($ProfileObject.Containers) }
     }
 
-    $handles = $null
-    if ($CheckInUse -and $targets.Count -gt 0) {
-        $handles = Get-FSLogixOpenHandle -Path @($targets.Path)
+    # Expand logical Cloud Cache containers into every physical provider path.
+    $physical = @()
+    foreach ($target in $targets) {
+        $physical += $target
+        foreach ($replica in @($target.ReplicaPaths)) {
+            $replicaRoot = @($ProfileObject.ProfileRoots | Where-Object {
+                $replica.StartsWith([IO.Path]::GetFullPath($_).TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)
+            } | Sort-Object Length -Descending | Select-Object -First 1)
+            if ($replicaRoot.Count -ne 1) { throw "Cannot resolve replica root: $replica" }
+            $copy = $target.PSObject.Copy()
+            $copy.Path = $replica
+            $copy.Root = $replicaRoot[0]
+            $copy.Directory = Split-Path -Parent $replica
+            $physical += $copy
+        }
+    }
+    $targets = @($physical | Sort-Object Path -Unique)
+    $handlesByServer = @{}
+    if ($CheckInUse) {
+        foreach ($serverGroup in @($targets | Group-Object -Property {
+            if ($_.Path -match '^\\\\(?<server>[^\\]+)\\') { $Matches['server'].ToLowerInvariant() } else { '[local]' }
+        })) {
+            $handlesByServer[$serverGroup.Name] = Get-FSLogixOpenHandle -Path @($serverGroup.Group.Path)
+        }
     }
 
     $safeUser = ($ProfileObject.UserName -replace ('[' + [regex]::Escape(-join [System.IO.Path]::GetInvalidFileNameChars()) + ']'), '_')
+    if ([string]::IsNullOrWhiteSpace($safeUser) -or $safeUser -in @('.', '..')) { $safeUser = '_user' }
 
     $plan = @()
     foreach ($container in $targets) {
         $newName = Get-FSLogixRetireTargetName -FileName $container.Name -BatchStamp $BatchStamp
         if ($MoveToRetired) {
             # Lift the retired file out of the user's writable directory into
-            # <root>\_retired\<user>\<batch-stamp>\ so it stops counting against
-            # the user's FSRM quota and falls outside the user's ACL scope.
+            # <root>\_retired\<user>\<batch-stamp>\. Operators must configure ACLs
+            # and quota exclusions for that location separately.
             $newDir  = Join-Path (Join-Path (Join-Path $container.Root '_retired') $safeUser) $BatchStamp
             $newPath = Join-Path $newDir $newName
         } else {
@@ -1239,6 +1353,8 @@ function Get-FSLogixRetirePlan {
             $state = 'Exists'
             $note  = 'Retire target already exists.'
         } elseif ($CheckInUse) {
+            $serverKey = if ($container.Path -match '^\\\\(?<server>[^\\]+)\\') { $Matches['server'].ToLowerInvariant() } else { '[local]' }
+            $handles = $handlesByServer[$serverKey]
             $probe = Get-FSLogixContainerState -Path $container.Path -OpenHandles $handles
             switch ($probe.State) {
                 'InUse'        { $state = 'InUse';        $holder = $probe.Holder; $note = 'Held open.' }
@@ -1259,6 +1375,26 @@ function Get-FSLogixRetirePlan {
             State        = $state
             Holder       = $holder
             Note         = $note
+        }
+    }
+
+    # Duplicate destinations (for example duplicate names beneath one root) must
+    # never overwrite a backup during a move.
+    foreach ($group in @($plan | Group-Object DestPath | Where-Object Count -gt 1)) {
+        foreach ($item in $group.Group) { $item.State = 'Exists'; $item.Note = 'Multiple containers resolve to the same retirement path.' }
+    }
+    if ($ProfileObject.CloudCacheMode) {
+        foreach ($logical in @($ProfileObject.Containers)) {
+            $paths = @($logical.Path) + @($logical.ReplicaPaths)
+            $logicalPlans = @($plan | Where-Object { $paths -contains $_.SourcePath })
+            $presentRoots = @($logicalPlans | ForEach-Object { [IO.Path]::GetFullPath($_.Root).TrimEnd('\') })
+            $missingRoots = @($ProfileObject.ExpectedProfileRoots | Where-Object { $presentRoots -notcontains $_ })
+            if ($missingRoots.Count -gt 0) {
+                foreach ($item in $logicalPlans) {
+                    $item.State = 'Missing'
+                    $item.Note = 'Cloud Cache replica not discovered in configured provider(s): ' + ($missingRoots -join ', ')
+                }
+            }
         }
     }
 
@@ -1288,7 +1424,7 @@ function Rename-FSLogixProfileObject {
         [ValidateSet('All', 'Office', 'Profile')][string]$Scope = 'All',
         [bool]$CheckInUse = $true,
         [string]$Reason,
-        [string]$BatchStamp,
+        [ValidatePattern('^\d{8}-\d{6}$')][string]$BatchStamp,
         [switch]$AllOrNothing,
         [switch]$Force,
         [switch]$RequireHorizonCheck,
@@ -1296,6 +1432,7 @@ function Rename-FSLogixProfileObject {
     )
 
     if (-not $BatchStamp) { $BatchStamp = New-FSLogixBatchStamp }
+    if ($ProfileObject.CloudCacheMode) { $AllOrNothing = $true }
 
     $user   = $ProfileObject.UserName
     $sid    = $ProfileObject.Sid
@@ -1355,7 +1492,12 @@ function Rename-FSLogixProfileObject {
                 & $log $result.AbortReason 'ERROR'
                 return $result
             }
-            $sessions = @(Get-FSLogixHorizonSession -UserName $user)
+            $sessions = Get-FSLogixHorizonSession -UserName $user
+            if ($null -eq $sessions) {
+                $result.Aborted = $true
+                $result.AbortReason = 'The required Horizon session check failed. No changes made.'
+                return $result
+            }
             if ($sessions.Count -gt 0) {
                 $states = ($sessions | ForEach-Object { $_.session_state }) -join ', '
                 $result.Aborted     = $true
@@ -1365,7 +1507,7 @@ function Rename-FSLogixProfileObject {
             }
         }
 
-        $plan = @(Get-FSLogixRetirePlan -ProfileObject $ProfileObject -Scope $Scope -BatchStamp $BatchStamp -CheckInUse:$CheckInUse -MoveToRetired:$MoveToRetired)
+        $plan = Get-FSLogixRetirePlan -ProfileObject $ProfileObject -Scope $Scope -BatchStamp $BatchStamp -CheckInUse:$CheckInUse -MoveToRetired:$MoveToRetired
         $result.Planned = $plan.Count
 
         if ($plan.Count -eq 0) {
@@ -1384,11 +1526,14 @@ function Rename-FSLogixProfileObject {
 
         $completed = @()
         foreach ($item in $plan) {
-            switch ($item.State) {
-                'Missing'      { $result.Missing++;       & $log "Missing (skip): $($item.SourcePath)" 'WARN'; continue }
-                'Exists'       { $result.SkippedExists++; & $log "Retire target exists (skip): $($item.DestPath)" 'WARN'; continue }
-                'InUse'        { $result.SkippedInUse++;  & $log ("IN USE (skip): {0}{1}" -f $item.SourcePath, $(if ($item.Holder) { " [held by $($item.Holder)]" } else { '' })) 'WARN'; continue }
-                'AccessDenied' { $result.Failed++;        & $log "Access denied (skip): $($item.SourcePath)" 'ERROR'; $result.Errors += "Access denied: $($item.SourcePath)"; continue }
+            if ($item.State -ne 'Ready') {
+              switch ($item.State) {
+                'Missing'      { $result.Missing++;       & $log "Missing (skip): $($item.SourcePath)" 'WARN' }
+                'Exists'       { $result.SkippedExists++; & $log "Retire target exists (skip): $($item.DestPath)" 'WARN' }
+                'InUse'        { $result.SkippedInUse++;  & $log ("IN USE (skip): {0}{1}" -f $item.SourcePath, $(if ($item.Holder) { " [held by $($item.Holder)]" } else { '' })) 'WARN' }
+                'AccessDenied' { $result.Failed++;        & $log "Access denied (skip): $($item.SourcePath)" 'ERROR'; $result.Errors += "Access denied: $($item.SourcePath)" }
+              }
+              continue
             }
 
             if (-not $PSCmdlet.ShouldProcess($item.SourcePath, "Retire to $($item.DestName)")) {
@@ -1402,6 +1547,14 @@ function Rename-FSLogixProfileObject {
             }
 
             try {
+                # Record intent before touching a container. A required central audit
+                # failure must leave the filesystem unchanged.
+                Write-FSLogixAudit -Critical -Record @{
+                    Action = 'RETIRE'; Mode = $mode; Reason = $Reason
+                    TargetUser = $user; TargetSid = $sid
+                    SourcePath = $item.SourcePath; DestPath = $item.DestPath
+                    SizeGB = $item.SizeGB; Result = 'STARTED'; HolderInfo = $item.Holder
+                }
                 if ($MoveToRetired) {
                     # Move across directories - the dest lives under
                     # <root>\_retired\<user>\<batch-stamp>\. Create the
@@ -1411,14 +1564,29 @@ function Rename-FSLogixProfileObject {
                     if (-not (Test-Path -LiteralPath $destDir)) {
                         [void](New-Item -Path $destDir -ItemType Directory -Force -ErrorAction Stop)
                     }
-                    Move-Item -LiteralPath $item.SourcePath -Destination $item.DestPath -Force -ErrorAction Stop
+                    $rootPrefix = [IO.Path]::GetFullPath($item.Root).TrimEnd('\') + '\'
+                    if (-not $item.SourcePath.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase)) { throw 'Source is outside the profile root.' }
+                    $manifest = [ordered]@{
+                        OriginalRelativePath = $item.SourcePath.Substring($rootPrefix.Length)
+                        UserName = $user; Sid = $sid; BatchStamp = $BatchStamp
+                    }
+                    $manifestPath = $item.DestPath + '.restore.json'
+                    if (Test-Path -LiteralPath $manifestPath) {
+                        $existingManifest = Get-Content -LiteralPath $manifestPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+                        if ($existingManifest.OriginalRelativePath -ne $manifest.OriginalRelativePath -or
+                            $existingManifest.UserName -ne $manifest.UserName -or
+                            $existingManifest.Sid -ne $manifest.Sid) { throw "A different restore manifest already exists: $manifestPath" }
+                    } else {
+                        $manifest | ConvertTo-Json | Set-Content -LiteralPath $manifestPath -Encoding UTF8 -ErrorAction Stop
+                    }
+                    [IO.File]::Move($item.SourcePath, $item.DestPath)
                 } else {
                     Rename-Item -LiteralPath $item.SourcePath -NewName $item.DestName -ErrorAction Stop
                 }
                 $result.Renamed++
                 $completed += $item
                 $result.Actions += $item
-                & $log (if ($MoveToRetired) { "Moved {0} -> {1}" } else { "Renamed {0} -> {1}" } -f $item.SourcePath, $item.DestPath) 'INFO'
+                & $log (("{0} {1} -> {2}") -f $(if ($MoveToRetired) { 'Moved' } else { 'Renamed' }), $item.SourcePath, $item.DestPath) 'INFO'
                 Write-FSLogixAudit -Critical -Record @{
                     Action = 'RETIRE'; Mode = $mode; Reason = $Reason
                     TargetUser = $user; TargetSid = $sid
@@ -1436,15 +1604,17 @@ function Rename-FSLogixProfileObject {
                     SizeGB = $item.SizeGB; Result = "FAILED: $($_.Exception.Message)"
                 }
 
-                if ($AllOrNothing) {
+                if ($AllOrNothing -or $script:AuditRootIsExplicit) {
                     & $log "All-or-nothing: rolling back $($completed.Count) rename(s) for '$user'." 'ERROR'
+                    $rolledBack = 0
                     foreach ($done in ($completed | Sort-Object -Property SourcePath -Descending)) {
                         try {
                             if ($MoveToRetired) {
-                                Move-Item -LiteralPath $done.DestPath -Destination $done.SourcePath -Force -ErrorAction Stop
+                                [IO.File]::Move($done.DestPath, $done.SourcePath)
                             } else {
                                 Rename-Item -LiteralPath $done.DestPath -NewName (Split-Path -Leaf $done.SourcePath) -ErrorAction Stop
                             }
+                            $rolledBack++
                             & $log "Rolled back $($done.DestPath) -> $($done.SourcePath)" 'WARN'
                             Write-FSLogixAudit -Record @{
                                 Action = 'RETIRE-ROLLBACK'; Mode = $mode; Reason = $Reason
@@ -1456,9 +1626,9 @@ function Rename-FSLogixProfileObject {
                             $result.Errors += "Rollback failed: $($done.DestPath)"
                         }
                     }
-                    $result.Renamed     = 0
+                    $result.Renamed     = $completed.Count - $rolledBack
                     $result.Aborted     = $true
-                    $result.AbortReason = 'Rename failed part-way; the batch was rolled back.'
+                    $result.AbortReason = if ($result.Renamed -eq 0) { 'Retirement failed; completed file moves were rolled back.' } else { 'Retirement failed and rollback was incomplete. Manual repair is required.' }
                     return $result
                 }
             }
@@ -1515,90 +1685,74 @@ function Restore-FSLogixProfileBatch {
         Errors      = @()
     }
 
-    # Phase 1: validate everything before touching anything.
+    # Validate the entire batch against current filesystem state, not report fields.
     $plan = @()
     foreach ($item in @($Container)) {
-        $retired = Test-FSLogixRetiredName -FileName $item.Name
-        if (-not $retired) {
-            $result.Aborted     = $true
-            $result.AbortReason = "'$($item.Name)' is not a retired container."
-            return $result
-        }
-
-        $livePath = Join-Path $item.Directory $retired.LiveName
-
-        if (-not (Test-Path -LiteralPath $item.Path)) {
-            $result.Aborted     = $true
-            $result.AbortReason = "Retired container has gone: $($item.Path)"
-            return $result
-        }
-
-        if (-not $SkipSignatureCheck) {
-            $signature = Test-FSLogixVhdSignature -Path $item.Path
-            if ($signature -eq 'Invalid') {
-                $result.Aborted     = $true
-                $result.AbortReason = "$($item.Name) fails its VHD signature check; refusing to restore it."
-                return $result
-            }
-        }
-
-        $displaceTo = $null
-        if (Test-Path -LiteralPath $livePath) {
-            if ($CheckInUse) {
-                $state = (Get-FSLogixContainerState -Path $livePath -OpenHandles (Get-FSLogixOpenHandle -Path @($livePath))).State
-                if ($state -eq 'InUse') {
-                    $result.Aborted     = $true
-                    $result.AbortReason = "The current container $livePath is mounted. Log the user off first."
-                    return $result
-                }
-            }
-            $base = [System.IO.Path]::GetFileNameWithoutExtension($retired.LiveName)
-            $ext  = [System.IO.Path]::GetExtension($retired.LiveName)
-            $displaceTo = Join-Path $item.Directory ('{0}-superseded-{1}{2}' -f $base, (New-FSLogixBatchStamp), $ext)
-        }
-
-        $plan += [PSCustomObject]@{
-            RetiredPath = $item.Path
-            LivePath    = $livePath
-            LiveName    = $retired.LiveName
-            DisplaceTo  = $displaceTo
-            SizeGB      = $item.SizeGB
-        }
-    }
-
-    # Phase 2: execute. Two renames per file, zero deletions.
-    foreach ($step in $plan) {
         try {
-            if ($step.DisplaceTo) {
-                if ($PSCmdlet.ShouldProcess($step.LivePath, "Displace to $(Split-Path -Leaf $step.DisplaceTo)")) {
-                    Rename-Item -LiteralPath $step.LivePath -NewName (Split-Path -Leaf $step.DisplaceTo) -ErrorAction Stop
-                    $result.Displaced++
-                    Write-FSLogixLog "Displaced current container $($step.LivePath) -> $($step.DisplaceTo)" 'WARN'
-                    Write-FSLogixAudit -Critical -Record @{
-                        Action = 'RESTORE-DISPLACE'; Mode = $mode; Reason = $Reason
-                        TargetUser = $UserName; TargetSid = $Sid
-                        SourcePath = $step.LivePath; DestPath = $step.DisplaceTo; Result = 'OK'
+            $file = Get-Item -LiteralPath $item.Path -ErrorAction Stop
+            $retired = Test-FSLogixRetiredName -FileName $file.Name
+            if (-not $retired -or $script:ContainerExtensions -notcontains $file.Extension.ToLowerInvariant()) { throw 'Not a retired container.' }
+            $root = if ($item.Root) { $item.Root } else { $file.DirectoryName }
+            $info = Get-FSLogixRestoreInfo -File $file -Root $root
+            if (-not $info.IsSafe) { throw 'Original path is unknown or the restore manifest is invalid. Manual recovery is required.' }
+            if (-not $SkipSignatureCheck -and (Test-FSLogixVhdSignature -Path $file.FullName) -ne 'Valid') { throw 'VHD signature could not be validated.' }
+            $livePath = $info.LivePath
+            if ($CheckInUse) {
+                foreach ($probePath in @($file.FullName, $livePath)) {
+                    if ((Test-Path -LiteralPath $probePath) -and
+                        (Get-FSLogixContainerState -Path $probePath -OpenHandles (Get-FSLogixOpenHandle -Path @($probePath))).State -ne 'Free') {
+                        throw "Container cannot be safely opened: $probePath"
                     }
                 }
             }
-
-            if ($PSCmdlet.ShouldProcess($step.RetiredPath, "Restore to $($step.LiveName)")) {
-                Rename-Item -LiteralPath $step.RetiredPath -NewName $step.LiveName -ErrorAction Stop
-                $result.Restored++
-                Write-FSLogixLog "Restored $($step.RetiredPath) -> $($step.LivePath)" 'INFO'
-                Write-FSLogixAudit -Critical -Record @{
-                    Action = 'RESTORE'; Mode = $mode; Reason = $Reason
-                    TargetUser = $UserName; TargetSid = $Sid
-                    SourcePath = $step.RetiredPath; DestPath = $step.LivePath
-                    SizeGB = $step.SizeGB; Result = 'OK'
-                }
-            } elseif ($isSim) {
-                Write-FSLogixLog "WHATIF: would restore $($step.RetiredPath) -> $($step.LivePath)" 'INFO'
+            $displaceTo = $null
+            if (Test-Path -LiteralPath $livePath) {
+                $base = [IO.Path]::GetFileNameWithoutExtension($retired.LiveName)
+                $ext = [IO.Path]::GetExtension($retired.LiveName)
+                $displaceTo = Join-Path (Split-Path -Parent $livePath) ('{0}-superseded-{1}{2}' -f $base, (New-FSLogixBatchStamp), $ext)
+                if (Test-Path -LiteralPath $displaceTo) { throw "Displacement target already exists: $displaceTo" }
             }
+            if ($plan.LivePath -contains $livePath) { throw "Multiple retired containers target $livePath. Select one retirement batch." }
+            $plan += [PSCustomObject]@{ RetiredPath = $file.FullName; LivePath = $livePath; DisplaceTo = $displaceTo; SizeGB = $item.SizeGB; DidDisplace = $false; DidRestore = $false }
         } catch {
-            $result.Failed++
-            $result.Errors += "$($step.RetiredPath): $($_.Exception.Message)"
-            Write-FSLogixLog "ERROR restoring $($step.RetiredPath): $($_.Exception.Message)" 'ERROR'
+            $result.Aborted = $true
+            $result.AbortReason = $_.Exception.Message
+            return $result
+        }
+    }
+    if (-not $PSCmdlet.ShouldProcess(($plan.LivePath -join ', '), "Restore $($plan.Count) retired container(s), preserving any current live files")) { return $result }
+    try {
+        # Audit all intents before the first mutation. Required audit outages fail closed.
+        foreach ($step in $plan) {
+            Write-FSLogixAudit -Critical -Record @{ Action = 'RESTORE'; Mode = $mode; Reason = $Reason; TargetUser = $UserName; TargetSid = $Sid; SourcePath = $step.RetiredPath; DestPath = $step.LivePath; Result = 'STARTED' }
+        }
+        foreach ($step in $plan) {
+            [void][IO.Directory]::CreateDirectory((Split-Path -Parent $step.LivePath))
+            if ($step.DisplaceTo) {
+                [IO.File]::Move($step.LivePath, $step.DisplaceTo)
+                $step.DidDisplace = $true
+                $result.Displaced++
+                Write-FSLogixAudit -Critical -Record @{ Action = 'RESTORE-DISPLACE'; Mode = $mode; Reason = $Reason; TargetUser = $UserName; TargetSid = $Sid; SourcePath = $step.LivePath; DestPath = $step.DisplaceTo; Result = 'OK' }
+            }
+            [IO.File]::Move($step.RetiredPath, $step.LivePath)
+            $step.DidRestore = $true
+            $result.Restored++
+            Write-FSLogixLog "Restored $($step.RetiredPath) -> $($step.LivePath)" 'INFO'
+            Write-FSLogixAudit -Critical -Record @{ Action = 'RESTORE'; Mode = $mode; Reason = $Reason; TargetUser = $UserName; TargetSid = $Sid; SourcePath = $step.RetiredPath; DestPath = $step.LivePath; SizeGB = $step.SizeGB; Result = 'OK' }
+        }
+    } catch {
+        $result.Failed++
+        $result.Aborted = $true
+        $result.AbortReason = 'Restore failed; rollback attempted. Review Errors for any manual recovery required.'
+        $result.Errors += $_.Exception.Message
+        # Reverse execution order, restoring both the original retirement and current live file.
+        [array]::Reverse($plan)
+        foreach ($step in $plan) {
+            try {
+                if ($step.DidRestore) { [IO.File]::Move($step.LivePath, $step.RetiredPath); $result.Restored-- }
+                if ($step.DidDisplace) { [IO.File]::Move($step.DisplaceTo, $step.LivePath); $result.Displaced-- }
+                Write-FSLogixAudit -Record @{ Action = 'RESTORE-ROLLBACK'; Mode = $mode; Reason = $Reason; TargetUser = $UserName; SourcePath = $step.LivePath; DestPath = $step.RetiredPath; Result = 'OK' }
+            } catch { $result.Errors += "Rollback failed: $($_.Exception.Message)" }
         }
     }
 
@@ -1644,11 +1798,13 @@ function Get-FSLogixRetiredContainer {
 
             $retiredOn  = if ($retired.RetiredOn) { $retired.RetiredOn } else { $file.LastWriteTime }
             $dateSource = if ($retired.RetiredOn) { 'stamp' } else { 'mtime-approx' }
-            $ageDays    = [int]($now - $retiredOn).TotalDays
+            $ageDays    = [int][Math]::Floor(($now - $retiredOn).TotalDays)
             if ($OlderThanDays -gt 0 -and $ageDays -lt $OlderThanDays) { continue }
 
             $identity = Resolve-FSLogixIdentity -FolderLeaf (Split-Path $file.DirectoryName -Leaf) -FileName $file.Name
-            $livePath = Join-Path $file.DirectoryName $retired.LiveName
+            $restoreInfo = Get-FSLogixRestoreInfo -File $file -Root $root
+            $livePath = $restoreInfo.LivePath
+            if ($restoreInfo.UserName) { $identity = [PSCustomObject]@{ UserName = $restoreInfo.UserName; Sid = $restoreInfo.Sid } }
 
             $results += [PSCustomObject]@{
                 UserName       = $identity.UserName
@@ -1664,7 +1820,9 @@ function Get-FSLogixRetiredContainer {
                 BatchStamp     = $retired.Stamp
                 DateSource     = $dateSource
                 LiveName       = $retired.LiveName
-                HasLiveSibling = (Test-Path -LiteralPath $livePath)
+                LivePath       = $livePath
+                CanRestore     = $restoreInfo.IsSafe
+                HasLiveSibling = ($restoreInfo.IsSafe -and (Test-Path -LiteralPath $livePath -PathType Leaf))
             }
         }
     }
@@ -1688,7 +1846,7 @@ function Remove-FSLogixRetiredContainer {
     [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High')]
     param(
         [Parameter(Mandatory = $true)][PSCustomObject[]]$Container,
-        [int]$RetentionFloorDays = 90,
+        [ValidateRange(90, 2147483647)][int]$RetentionFloorDays = 90,
         [switch]$AllowLastCopy,
         [switch]$IncludeUndated,
         [string]$Reason
@@ -1701,6 +1859,27 @@ function Remove-FSLogixRetiredContainer {
     }
 
     foreach ($item in @($Container)) {
+        # A report can be stale or supplied by a caller. Re-read all deletion guards
+        # from the file and its retirement suffix immediately before acting.
+        try {
+            $file = Get-Item -LiteralPath $item.Path -ErrorAction Stop
+            $retired = Test-FSLogixRetiredName -FileName $file.Name
+            if ($file.PSIsContainer -or $script:ContainerExtensions -notcontains $file.Extension.ToLowerInvariant() -or -not $retired) { throw 'Refusing to purge a file that is not a retired VHD/VHDX container.' }
+            $root = if ($item.Root) { $item.Root } else { $file.DirectoryName }
+            $restoreInfo = Get-FSLogixRestoreInfo -File $file -Root $root
+            $retiredOn = if ($retired.RetiredOn) { $retired.RetiredOn } else { $file.LastWriteTime }
+            $item = [PSCustomObject]@{
+                Path = $file.FullName; SizeGB = [Math]::Round($file.Length / 1GB, 3)
+                AgeDays = [int][Math]::Floor(((Get-Date) - $retiredOn).TotalDays)
+                DateSource = $(if ($retired.RetiredOn) { 'stamp' } else { 'mtime-approx' })
+                HasLiveSibling = ($restoreInfo.IsSafe -and (Test-Path -LiteralPath $restoreInfo.LivePath -PathType Leaf))
+                UserName = $item.UserName; Sid = $item.Sid
+            }
+        } catch {
+            $result.Failed++
+            $result.Errors += $_.Exception.Message
+            continue
+        }
         if ($item.AgeDays -lt $RetentionFloorDays) {
             $result.SkippedTooNew++
             Write-FSLogixLog "Retention floor ($RetentionFloorDays d): keeping $($item.Path) (age $($item.AgeDays) d)." 'WARN'
@@ -1719,6 +1898,11 @@ function Remove-FSLogixRetiredContainer {
 
         if ($PSCmdlet.ShouldProcess($item.Path, "Delete retired container ($($item.SizeGB) GB, age $($item.AgeDays) d)")) {
             try {
+                Write-FSLogixAudit -Critical -Record @{
+                    Action = 'PURGE'; Mode = $mode; Reason = $Reason
+                    TargetUser = $item.UserName; TargetSid = $item.Sid
+                    SourcePath = $item.Path; SizeGB = $item.SizeGB; Result = 'STARTED'
+                }
                 Remove-Item -LiteralPath $item.Path -Force -ErrorAction Stop
                 $result.Removed++
                 $result.ReclaimedGB = [Math]::Round($result.ReclaimedGB + $item.SizeGB, 3)

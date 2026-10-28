@@ -9,7 +9,7 @@ Environment:
 This tool:
   - Finds all *.vhd / *.vhdx under the root(s)
   - Derives username + SID from the folder or filename (both FlipFlop orders + NoProfileContainingFolder)
-  - Shows one row per user (aggregated across SIDs) with SID breakdown
+  - Shows one row per SID identity, falling back to a parsed username
   - Detects corrupt profiles, orphaned users (not in AD), and disk space issues
   - Lets you filter, highlight big profiles, and retire containers (with WhatIf by default).
   - Supports multiple profile roots (Cloud Cache), CSV export, column sorting, and theming.
@@ -19,13 +19,36 @@ is the WinForms host.
 #>
 
 param(
-    [string]$DefaultProfileRoot = "\\fml-fslogix\FSLogixUserProfiles"
+    [string]$DefaultProfileRoot = "\\fml-fslogix\FSLogixUserProfiles",
+    # Build real controls without entering the main modal loop (for host/test use).
+    [switch]$InitializeOnly
 )
 
 $appVersion = "0.8.0"
 
+if ([Threading.Thread]::CurrentThread.ApartmentState -ne 'STA') {
+    throw 'The GUI requires STA mode. Launch powershell.exe -STA -File .\FSLogixProfileGUI.ps1.'
+}
+
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
+
+function Show-FSLogixDialog {
+    param([System.Windows.Forms.Form]$Dialog, [System.Windows.Forms.IWin32Window]$Owner)
+    if ($Owner) { return $Dialog.ShowDialog($Owner) }
+    return $Dialog.ShowDialog()
+}
+
+function Show-FSLogixMessage {
+    param(
+        [string]$Text,
+        [string]$Caption = 'FSLogix Profile Manager',
+        [System.Windows.Forms.MessageBoxButtons]$Buttons = 'OK',
+        [System.Windows.Forms.MessageBoxIcon]$Icon = 'None',
+        [System.Windows.Forms.MessageBoxDefaultButton]$DefaultButton = 'Button1'
+    )
+    return [System.Windows.Forms.MessageBox]::Show($Text, $Caption, $Buttons, $Icon, $DefaultButton)
+}
 
 # --------------------------------------------------------------------
 #  Logging helper for embedded log panel (defined first; module hooks in below)
@@ -182,7 +205,8 @@ function Export-GridToCSV {
     $sb = [System.Text.StringBuilder]::new()
 
     $headers = @()
-    foreach ($col in $Grid.Columns) {
+    $columns = @($Grid.Columns | Sort-Object DisplayIndex)
+    foreach ($col in $columns) {
         $headers += "`"$($col.HeaderText)`""
     }
     [void]$sb.AppendLine(($headers -join ","))
@@ -190,7 +214,8 @@ function Export-GridToCSV {
     foreach ($row in $Grid.Rows) {
         $obj = $row.Tag
         $values = @()
-        foreach ($cell in $row.Cells) {
+        foreach ($col in $columns) {
+            $cell = $row.Cells[$col.Index]
             $val = ""
             # The SIDs cell is truncated for display ("... (+N more)"). Export
             # the full list from the profile object so the CSV is complete.
@@ -241,13 +266,9 @@ function Show-ResetConfirmation {
 
     if (-not $large) {
         $summary = "Users: $displayNames`n`nContainers: $ContainerCount`nMode: $modeText`nWhatIf: $WhatIf"
-        $resp = [System.Windows.Forms.MessageBox]::Show(
-            $summary + "`n`nProceed?",
-            "Confirm Reset - $(if ($WhatIf) {'SIMULATION'} else {'LIVE'})",
-            [System.Windows.Forms.MessageBoxButtons]::YesNo,
-            [System.Windows.Forms.MessageBoxIcon]::Warning,
-            [System.Windows.Forms.DialogResult]::No
-        )
+        $resp = Show-FSLogixMessage -Text ($summary + "`n`nProceed?") `
+            -Caption "Confirm Reset - $(if ($WhatIf) {'SIMULATION'} else {'LIVE'})" `
+            -Buttons YesNo -Icon Warning -DefaultButton Button2
         return ($resp -eq [System.Windows.Forms.DialogResult]::Yes)
     }
 
@@ -310,7 +331,9 @@ function Show-ResetConfirmation {
     $form.AcceptButton = $btnConfirm
     $form.CancelButton = $btnCancel
 
-    return ($form.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK)
+    $result = Show-FSLogixDialog -Dialog $form
+    $form.Dispose()
+    return ($result -eq [System.Windows.Forms.DialogResult]::OK)
 }
 
 # --------------------------------------------------------------------
@@ -319,7 +342,7 @@ function Show-ResetConfirmation {
 function Show-HorizonConnectDialog {
     $dlg = New-Object System.Windows.Forms.Form
     $dlg.Text = "Connect to Horizon Connection Server"
-    $dlg.Size = New-Object System.Drawing.Size(440, 260)
+    $dlg.ClientSize = New-Object System.Drawing.Size(440, 240)
     $dlg.StartPosition = "CenterParent"
     $dlg.FormBorderStyle = "FixedDialog"
     $dlg.MinimizeBox = $false
@@ -399,10 +422,11 @@ function Show-HorizonConnectDialog {
     $dlg.AcceptButton = $btnConnect
     $dlg.CancelButton = $btnCancel
 
-    if ($dlg.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) { return }
+    if ((Show-FSLogixDialog -Dialog $dlg) -ne [System.Windows.Forms.DialogResult]::OK) { $dlg.Dispose(); return }
 
     if ([string]::IsNullOrWhiteSpace($txtServer.Text) -or [string]::IsNullOrWhiteSpace($txtUser.Text)) {
-        [System.Windows.Forms.MessageBox]::Show("Server and username are required.")
+        [void](Show-FSLogixMessage -Text 'Server and username are required.')
+        $dlg.Dispose()
         return
     }
 
@@ -413,11 +437,11 @@ function Show-HorizonConnectDialog {
     try {
         Connect-FSLogixHorizon -Server $txtServer.Text -Credential $cred -Domain $domain -SkipCertificateCheck:$chkSkipCert.Checked
         Add-LogMessage "Connected to Horizon: $txtServer.Text" "INFO"
-        [System.Windows.Forms.MessageBox]::Show("Connected to $($txtServer.Text).", "Horizon", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
+        [void](Show-FSLogixMessage -Text "Connected to $($txtServer.Text)." -Caption Horizon -Icon Information)
     } catch {
         Add-LogMessage "Horizon connect failed: $($_.Exception.Message)" "ERROR"
-        [System.Windows.Forms.MessageBox]::Show("Failed: $($_.Exception.Message)", "Horizon", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
-    }
+        [void](Show-FSLogixMessage -Text "Failed: $($_.Exception.Message)" -Caption Horizon -Icon Error)
+    } finally { $txtPass.Clear(); $dlg.Dispose() }
 }
 
 # --------------------------------------------------------------------
@@ -429,7 +453,7 @@ function Show-SettingsDialog {
 
     $dlg = New-Object System.Windows.Forms.Form
     $dlg.Text = "Settings"
-    $dlg.Size = New-Object System.Drawing.Size(560, 200)
+    $dlg.ClientSize = New-Object System.Drawing.Size(560, 180)
     $dlg.StartPosition = "CenterParent"
     $dlg.FormBorderStyle = "FixedDialog"
     $dlg.MinimizeBox = $false
@@ -494,11 +518,12 @@ function Show-SettingsDialog {
     $dlg.AcceptButton = $btnSave
     $dlg.CancelButton = $btnCancel
 
-    if ($dlg.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) { return }
+    if ((Show-FSLogixDialog -Dialog $dlg) -ne [System.Windows.Forms.DialogResult]::OK) { $dlg.Dispose(); return }
 
     Set-FSLogixAuditRoot -Path $txtRoot.Text
     $script:AuditRootIsExplicit = $true
     Add-LogMessage "Audit root set to: $($txtRoot.Text)" "INFO"
+    $dlg.Dispose()
 }
 
 # --------------------------------------------------------------------
@@ -558,15 +583,12 @@ function Show-RetiredDialog {
     $gridRet.AutoGenerateColumns = $false
     $dlg.Controls.Add($gridRet)
 
-    [void]$gridRet.Columns.Add("User",         120)
-    [void]$gridRet.Columns.Add("Class",         60)
-    [void]$gridRet.Columns.Add("Size (GB)",     70)
-    [void]$gridRet.Columns.Add("Retired On",   150)
-    [void]$gridRet.Columns.Add("Age (d)",       60)
-    [void]$gridRet.Columns.Add("Last Copy",     75)
-    [void]$gridRet.Columns.Add("Source",        90)
-    [void]$gridRet.Columns.Add("Name",         200)
-    [void]$gridRet.Columns.Add("Directory",    280)
+    foreach ($column in @(@('User',120), @('Class',60), @('Size (GB)',70),
+            @('Retired On',150), @('Age (d)',60), @('Last Copy',75),
+            @('Source',90), @('Name',200), @('Directory',280))) {
+        $index = $gridRet.Columns.Add([string]$column[0], [string]$column[0])
+        $gridRet.Columns[$index].Width = [int]$column[1]
+    }
 
     $btnPurge = New-Object System.Windows.Forms.Button
     $btnPurge.Text = "Purge..."
@@ -591,7 +613,7 @@ function Show-RetiredDialog {
 
     function Refresh-RetiredList {
         $gridRet.Rows.Clear()
-        $items = @(Get-FSLogixRetiredContainer -ProfileRoots $Roots -OlderThanDays ([int]$numAge.Value))
+        $items = Get-FSLogixRetiredContainer -ProfileRoots $Roots -OlderThanDays ([int]$numAge.Value)
         foreach ($item in $items) {
             $idx = $gridRet.Rows.Add()
             $r = $gridRet.Rows[$idx]
@@ -626,20 +648,18 @@ function Show-RetiredDialog {
             [System.Windows.Forms.MessageBox]::Show("A reason / ticket is required for restores. Set one in the main window.")
             return
         }
-        $confirm = [System.Windows.Forms.MessageBox]::Show(
-            "Restore $($selected.Count) retired container(s) back to their live name?`n`nThis reverses a retire - the live container (if any) will be displaced to *-superseded-<stamp>.",
-            "Confirm Restore", [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Warning, [System.Windows.Forms.DialogResult]::No)
+        $confirm = Show-FSLogixMessage -Text "Restore $($selected.Count) retired container(s) back to their live name?`n`nThis reverses a retire - the live container (if any) will be displaced to *-superseded-<stamp>." `
+            -Caption 'Confirm Restore' -Buttons YesNo -Icon Warning -DefaultButton Button2
         if ($confirm -ne [System.Windows.Forms.DialogResult]::Yes) { return }
 
-        $totalRestored = 0; $totalDisplaced = 0; $totalFailed = 0
-        foreach ($item in $selected) {
-            $r = Restore-FSLogixProfileBatch -Container @($item) -Reason $reason -Confirm:$false
-            $totalRestored  += $r.Restored
-            $totalDisplaced += $r.Displaced
-            $totalFailed    += $r.Failed
-        }
-        Add-LogMessage "Restore: $totalRestored restored, $totalDisplaced displaced, $totalFailed failed (of $($selected.Count) selected)" "INFO"
-        [System.Windows.Forms.MessageBox]::Show("Restored: $totalRestored`nDisplaced: $totalDisplaced`nFailed: $totalFailed")
+        # Keep one selection transactional: do not restore half the batch if a
+        # later container cannot be safely restored.
+        $r = Restore-FSLogixProfileBatch -Container $selected -Reason $reason -Confirm:$false
+        $totalRestored = $r.Restored; $totalDisplaced = $r.Displaced; $totalFailed = $r.Failed
+        $restoreText = "Restored: $totalRestored`nDisplaced: $totalDisplaced`nFailed: $totalFailed"
+        if ($r.Aborted) { $restoreText += "`n`nAborted: $($r.AbortReason)" }
+        Add-LogMessage ($restoreText -replace "`n", ' | ') $(if ($r.Aborted) {'ERROR'} else {'INFO'})
+        [void](Show-FSLogixMessage -Text $restoreText)
         Refresh-RetiredList
     })
 
@@ -666,7 +686,7 @@ function Show-RetiredDialog {
         }
         $msg += "Retention floor: 90 days. Anything younger is refused."
 
-        $confirm = [System.Windows.Forms.MessageBox]::Show($msg, "Confirm Purge", [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Warning, [System.Windows.Forms.DialogResult]::No)
+        $confirm = Show-FSLogixMessage -Text $msg -Caption 'Confirm Purge' -Buttons YesNo -Icon Warning -DefaultButton Button2
         if ($confirm -ne [System.Windows.Forms.DialogResult]::Yes) { return }
 
         $purgeArgs = @{
@@ -679,11 +699,11 @@ function Show-RetiredDialog {
         if ($hasUndated.Count -gt 0)  { $purgeArgs.IncludeUndated = $true }
         $purgeResult = Remove-FSLogixRetiredContainer @purgeArgs
         Add-LogMessage "Purge: $($purgeResult.Removed) removed, $($purgeResult.SkippedLastCopy) last-copy skipped, $($purgeResult.SkippedUndated) undated skipped, $($purgeResult.SkippedTooNew) too-new skipped, $($purgeResult.Failed) failed" "INFO"
-        [System.Windows.Forms.MessageBox]::Show("Removed: $($purgeResult.Removed)`nLast-copy skipped: $($purgeResult.SkippedLastCopy)`nUndated skipped: $($purgeResult.SkippedUndated)`nToo-new skipped: $($purgeResult.SkippedTooNew)`nFailed: $($purgeResult.Failed)`nReclaimed: $([Math]::Round($purgeResult.ReclaimedGB, 2)) GB")
+        [void](Show-FSLogixMessage -Text "Removed: $($purgeResult.Removed)`nLast-copy skipped: $($purgeResult.SkippedLastCopy)`nUndated skipped: $($purgeResult.SkippedUndated)`nToo-new skipped: $($purgeResult.SkippedTooNew)`nFailed: $($purgeResult.Failed)`nReclaimed: $([Math]::Round($purgeResult.ReclaimedGB, 2)) GB")
         Refresh-RetiredList
     })
 
-    $dlg.ShowDialog() | Out-Null
+    [void](Show-FSLogixDialog -Dialog $dlg)
     $dlg.Dispose()
 }
 
@@ -755,7 +775,7 @@ function Show-RenamePreviewDialog {
     $inUseCount = 0
     $notReadyCount = 0
     foreach ($profile in $SelectedProfiles) {
-        $plan = @(Get-FSLogixRetirePlan -ProfileObject $profile -Scope $Scope -CheckInUse:$CheckInUse -MoveToRetired:$MoveToRetired)
+        $plan = Get-FSLogixRetirePlan -ProfileObject $profile -Scope $Scope -CheckInUse:$CheckInUse -MoveToRetired:$MoveToRetired
         foreach ($item in $plan) {
             $listItem = New-Object System.Windows.Forms.ListViewItem($item.UserName)
             [void]$listItem.SubItems.Add($item.Class)
@@ -807,7 +827,7 @@ function Show-RenamePreviewDialog {
     $previewForm.AcceptButton = $btnCancel
     $previewForm.CancelButton = $btnCancel
 
-    $result = $previewForm.ShowDialog()
+    $result = Show-FSLogixDialog -Dialog $previewForm
     $previewForm.Dispose()
     return $result
 }
@@ -1327,6 +1347,7 @@ $form.Controls.Add($chkMoveRetired)
 
 $btnDelete = New-Object System.Windows.Forms.Button
 $btnDelete.Text = "Reset Profile"
+$btnDelete.Enabled = $false
 $btnDelete.Location = New-Object System.Drawing.Point(950, 710)
 $btnDelete.Size = New-Object System.Drawing.Size(100, 28)
 $btnDelete.Anchor = "Bottom,Right"
@@ -1345,18 +1366,28 @@ $script:AllProfiles = @()
 # --------------------------------------------------------------------
 #  Show profiles in the grid
 # --------------------------------------------------------------------
+function Get-GridProfileKey($Profile) {
+    if ($Profile.Sid) { return 'sid:' + $Profile.Sid }
+    if (-not $Profile.IsIdentityResolved) { return 'path:' + $Profile.RootFolder }
+    return 'user:' + $Profile.UserName
+}
+
 function Show-ProfilesInGrid {
     param(
         [System.Collections.IEnumerable]$Profiles
     )
 
     # Capture current selection so we can restore it after the repaint.
-    $priorUsers = New-Object System.Collections.Generic.HashSet[string]
+    $priorUsers = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     foreach ($sel in $grid.SelectedRows) {
-        if ($sel.Tag -and $sel.Tag.UserName) { [void]$priorUsers.Add($sel.Tag.UserName) }
+        if ($sel.Tag) { [void]$priorUsers.Add((Get-GridProfileKey $sel.Tag)) }
     }
     $priorTopRow = $grid.FirstDisplayedScrollingRowIndex
 
+    # Apply the chosen sort after every filter/rescan, not only its glyph.
+    if ($script:SortColumn -ge 0) {
+        $Profiles = Get-SortedGridProfiles -Profiles $Profiles -ColumnIndex $script:SortColumn
+    }
     $grid.Rows.Clear()
 
     foreach ($p in $Profiles) {
@@ -1399,12 +1430,13 @@ function Show-ProfilesInGrid {
                             -DefaultColor $script:DefaultRowBackColor `
                             -HighlightColor $script:CurrentHighlightColor
 
-        if ($priorUsers.Contains($p.UserName)) { $row.Selected = $true }
     }
 
-    # Don't auto-select row 0 - the four-click mass retire relied on this.
-    if ($grid.SelectedRows.Count -eq 0 -and $grid.Rows.Count -gt 0) {
-        $grid.ClearSelection()
+    # DataGridView automatically selects row 0 while adding rows. Explicitly
+    # clear that implicit selection before restoring only operator selections.
+    $grid.ClearSelection()
+    foreach ($row in $grid.Rows) {
+        if ($priorUsers.Contains((Get-GridProfileKey $row.Tag))) { $row.Selected = $true }
     }
 
     if ($null -ne $priorTopRow -and $priorTopRow -ge 0 -and $priorTopRow -lt $grid.Rows.Count) {
@@ -1415,6 +1447,26 @@ function Show-ProfilesInGrid {
     if ($script:SortColumn -ge 0 -and $script:SortColumn -lt $grid.Columns.Count) {
         $grid.Columns[$script:SortColumn].HeaderCell.SortGlyphDirection = if ($script:SortAscending) { "Ascending" } else { "Descending" }
     }
+}
+
+function Get-SortedGridProfiles {
+    param($Profiles, [int]$ColumnIndex)
+    $sorted = switch ($ColumnIndex) {
+        0 { $Profiles | Sort-Object UserName }
+        1 { $Profiles | Sort-Object ContainerCount }
+        2 { $Profiles | Sort-Object TotalSizeGB }
+        3 { $Profiles | Sort-Object { if ($null -ne $_.MaxSizeGB) { $_.MaxSizeGB } else { -1 } } }
+        4 { $Profiles | Sort-Object OfficeSizeGB }
+        5 { $Profiles | Sort-Object LastWriteTime }
+        6 { $Profiles | Sort-Object { if ($_.HealthIssues.Count) { $_.HealthIssues -join ', ' } else { 'OK' } } }
+        7 { $Profiles | Sort-Object { $_.SIDs -join '; ' } }
+        8 { $Profiles | Sort-Object { if ($_.ADLastLogon) { $_.ADLastLogon } else { [datetime]::MaxValue } } }
+        9 { $Profiles | Sort-Object RootFolder }
+        default { $Profiles }
+    }
+    $rows = @($sorted)
+    if (-not $script:SortAscending -and $rows.Count -gt 1) { [array]::Reverse($rows) }
+    return ,$rows
 }
 
 function Refresh-RowHighlights {
@@ -1437,6 +1489,7 @@ $grid.Add_ColumnHeaderMouseClick({
     param($sender, $e)
 
     $colIndex = $e.ColumnIndex
+    if ($colIndex -lt 0) { return }
 
     if ($script:SortColumn -eq $colIndex) {
         $script:SortAscending = -not $script:SortAscending
@@ -1450,31 +1503,7 @@ $grid.Add_ColumnHeaderMouseClick({
         if ($row.Tag) { $profiles += $row.Tag }
     }
 
-    $sorted = switch ($colIndex) {
-        0 { $profiles | Sort-Object UserName }
-        1 { $profiles | Sort-Object ContainerCount }
-        2 { $profiles | Sort-Object TotalSizeGB }
-        3 { $profiles | Sort-Object { if ($_.MaxSizeGB) { $_.MaxSizeGB } else { -1 } } }
-        4 { $profiles | Sort-Object OfficeSizeGB }
-        5 { $profiles | Sort-Object LastWriteTime }
-        # Status and SIDs sort by the displayed text (the same thing the user sees
-        # in the cell), not by the count of items behind them.
-        6 { $profiles | Sort-Object { ($_.HealthIssues | Sort-Object) -join ', ' } }
-        7 { $profiles | Sort-Object { ($_.SIDs       | Sort-Object) -join '; ' } }
-        # AD last logon sorts with unknowns (null) at the end.
-        8 { $profiles | Sort-Object { if ($_.ADLastLogon) { $_.ADLastLogon } else { [datetime]::MaxValue } } }
-        9 { $profiles | Sort-Object RootFolder }
-        default { $profiles }
-    }
-
-    if (-not $script:SortAscending) {
-        # [array]::Reverse throws on a 0- or 1-row grid.
-        $arr = @($sorted)
-        if ($arr.Count -gt 1) { [array]::Reverse($arr) }
-        $sorted = $arr
-    }
-
-    Show-ProfilesInGrid $sorted
+    Show-ProfilesInGrid $profiles
 
     foreach ($col in $grid.Columns) {
         $col.HeaderCell.SortGlyphDirection = "None"
@@ -1501,12 +1530,17 @@ $script:ScanState = @{
     Form       = $null
     Roots      = @()
 }
+$script:ScanIsComplete = $false
 
 function Start-BackgroundScan {
     param(
         [string[]]$Roots,
         [bool]$CheckOrphans
     )
+
+    # Displayed rows may belong to an earlier scan. They are never actionable
+    # again until every configured root has been enumerated successfully.
+    $script:ScanIsComplete = $false
 
     # Tear down any previous scan.
     if ($script:ScanState.PowerShell) {
@@ -1597,7 +1631,7 @@ function Start-BackgroundScan {
 
     $modPath = (Resolve-Path (Join-Path $PSScriptRoot 'FSLogixProfileCore.psm1')).Path
 
-    $ps.AddScript({
+    [void]$ps.AddScript({
         param($mp, $r, $o)
         try {
             Import-Module $mp -Force
@@ -1605,7 +1639,7 @@ function Start-BackgroundScan {
                 param($m, $l)
                 $ScanQueue.Enqueue([PSCustomObject]@{Message = $m; Level = $l})
             }
-            $result = @(Get-FSLogixProfiles -ProfileRoots $r -CheckOrphans:$o)
+            $result = Get-FSLogixProfiles -ProfileRoots $r -CheckOrphans:$o -ErrorOnIncomplete
             $ScanQueue.Enqueue([PSCustomObject]@{Result = $result; Done = $true})
         } catch {
             $ScanQueue.Enqueue([PSCustomObject]@{Error = $_.Exception.Message; Done = $true})
@@ -1622,7 +1656,7 @@ function Start-BackgroundScan {
         $item = $null
         while ($script:ScanState.Queue.TryDequeue([ref]$item)) {
             if ($item.Done) {
-                $timer.Stop()
+                $script:ScanState.Timer.Stop()
                 if ($item.Error) { $script:ScanState.Exception = $item.Error }
                 else            { $script:ScanState.Result = $item.Result }
                 try { $script:ScanState.Form.Close() } catch { }
@@ -1633,18 +1667,32 @@ function Start-BackgroundScan {
                 $pfStatus = $script:ScanState.Form.Controls[1]
                 try { $pfStatus.Text = $item.Message } catch { }
             }
+            if ($item.Level -and $item.Level -ne 'PROGRESS') {
+                Add-LogMessage $item.Message $item.Level
+            }
+        }
+        if ($script:ScanState.PowerShell -and $script:ScanState.Async.IsCompleted -and $script:ScanState.Queue.IsEmpty) {
+            # A cancelled/stopped pipeline need not enqueue a Done record.
+            $script:ScanState.Timer.Stop()
+            if (-not $script:ScanState.Cancelled) { $script:ScanState.Exception = 'Scan ended without a result.' }
+            try { $script:ScanState.Form.Close() } catch { }
+            On-ScanComplete
         }
     })
     $script:ScanState.Timer = $timer
     $timer.Start()
 
-    [void]$pf.ShowDialog($form)
+    [void](Show-FSLogixDialog -Dialog $pf -Owner $form)
+    if ($script:ScanState.PowerShell) {
+        $script:ScanState.Cancelled = $true
+        On-ScanComplete
+    }
 }
 
 function On-ScanComplete {
     $btnLoad.Enabled    = $true
     $btnRescan.Enabled  = $true
-    $btnDelete.Enabled  = $true
+    $btnDelete.Enabled  = $false
     $btnExport.Enabled  = $true
 
     if ($script:ScanState.Form) {
@@ -1668,7 +1716,7 @@ function On-ScanComplete {
     } elseif ($script:ScanState.Exception) {
         Add-LogMessage "Scan failed: $($script:ScanState.Exception)" "ERROR"
         $script:lblStatus.Text = "Scan failed."
-        [System.Windows.Forms.MessageBox]::Show("Error: $($script:ScanState.Exception)")
+        [void](Show-FSLogixMessage -Text "Error: $($script:ScanState.Exception)")
     } else {
         $script:AllProfiles = @($script:ScanState.Result)
         $ageDays = if ($chkAge.Checked) { [int]$numAge.Value } else { 0 }
@@ -1682,6 +1730,8 @@ function On-ScanComplete {
         $issueCount = @($script:AllProfiles | Where-Object { $_.HealthIssues.Count -gt 0 }).Count
         $script:lblStatus.Text = "Loaded $($filtered.Count) user(s) from $($script:ScanState.Roots.Count) root(s). Issues: $issueCount"
         Add-LogMessage "Loaded $($filtered.Count) user(s), $issueCount with issues" "INFO"
+        $script:ScanIsComplete = $true
+        $btnDelete.Enabled = $true
     }
 
     $script:ScanState.PowerShell = $null
@@ -1697,16 +1747,35 @@ function On-ScanComplete {
 #  Load profiles
 # --------------------------------------------------------------------
 function Load-Profiles {
+    $script:ScanIsComplete = $false
+    $btnDelete.Enabled = $false
     Clear-FSLogixADCache
     $roots = $txtRoot.Text -split ';' | ForEach-Object { $_.Trim() } | Where-Object { $_ }
     if ($roots.Count -eq 0) {
-        [System.Windows.Forms.MessageBox]::Show("No profile roots specified.")
+        [void](Show-FSLogixMessage -Text 'No profile roots specified.')
         return
+    }
+    foreach ($root in $roots) {
+        try {
+            $rootItem = Get-Item -LiteralPath $root -ErrorAction Stop
+            if (-not $rootItem.PSIsContainer) { throw 'The path is not a directory.' }
+        } catch {
+            $message = "Cannot scan profile root '$root': $($_.Exception.Message)"
+            Add-LogMessage $message 'ERROR'
+            $script:lblStatus.Text = 'Scan incomplete. Reset disabled until every root can be scanned.'
+            [void](Show-FSLogixMessage -Text $message -Caption 'Scan incomplete' -Icon Error)
+            return
+        }
     }
     Start-BackgroundScan -Roots $roots -CheckOrphans $chkCheckOrphans.Checked
 }
 
 $btnLoad.Add_Click({ Load-Profiles })
+$txtRoot.Add_TextChanged({
+    $script:ScanIsComplete = $false
+    $btnDelete.Enabled = $false
+    $script:lblStatus.Text = 'Profile roots changed. Load profiles before resetting.'
+})
 
 $btnRescan.Add_Click({
     Add-LogMessage "Manual rescan triggered" "INFO"
@@ -1781,6 +1850,10 @@ $btnExport.Add_Click({
 #  Reset Profile (retire / rename) Selected
 # --------------------------------------------------------------------
 $btnDelete.Add_Click({
+    if (-not $script:ScanIsComplete) {
+        [void](Show-FSLogixMessage -Text 'Complete a successful scan of every configured root before resetting profiles.' -Caption 'Scan required' -Icon Warning)
+        return
+    }
     if ($grid.SelectedRows.Count -eq 0) {
         [System.Windows.Forms.MessageBox]::Show("No users selected. Click one or more rows first.")
         return
@@ -1798,7 +1871,7 @@ $btnDelete.Add_Click({
     # a missing ticket number makes the trail useless. WhatIf is allowed
     # without one because nothing actually changes.
     if (-not $whatIf -and [string]::IsNullOrWhiteSpace($reason)) {
-        [System.Windows.Forms.MessageBox]::Show("A reason / ticket number is required for live runs.`n`nWhatIf is still allowed without one.", "Reason required", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning)
+        [void](Show-FSLogixMessage -Text "A reason / ticket number is required for live runs.`n`nWhatIf is still allowed without one." -Caption 'Reason required' -Icon Warning)
         $txtReason.Focus()
         return
     }
@@ -1811,7 +1884,7 @@ $btnDelete.Add_Click({
     # Build the plan up front so the same numbers appear in preview and confirmation.
     $planTotal = 0
     foreach ($p in $selectedProfiles) {
-        $plan = @(Get-FSLogixRetirePlan -ProfileObject $p -Scope $scope -CheckInUse:$checkInUse -MoveToRetired:$chkMoveRetired.Checked)
+        $plan = Get-FSLogixRetirePlan -ProfileObject $p -Scope $scope -CheckInUse:$checkInUse -MoveToRetired:$chkMoveRetired.Checked
         $planTotal += $plan.Count
     }
 
@@ -1838,7 +1911,7 @@ $btnDelete.Add_Click({
     $results = @()
     try {
         foreach ($obj in $selectedProfiles) {
-            $r = Rename-FSLogixProfileObject -ProfileObject $obj -Scope $scope -CheckInUse:$checkInUse -Reason $reason -MoveToRetired:$chkMoveRetired.Checked -Confirm:$false
+            $r = Rename-FSLogixProfileObject -ProfileObject $obj -Scope $scope -CheckInUse:$checkInUse -Reason $reason -MoveToRetired:$chkMoveRetired.Checked -AllOrNothing -RequireHorizonCheck:(Test-FSLogixHorizonConnected) -WhatIf:$whatIf -Confirm:$false
             $results += $r
         }
     } finally {
@@ -1889,7 +1962,7 @@ $btnDelete.Add_Click({
         $resultText += "`nLogs:`n"
         foreach ($l in $totals.Logs) { $resultText += "  $l`n" }
     }
-    [System.Windows.Forms.MessageBox]::Show($resultText, "Reset Results - $modeName")
+    [void](Show-FSLogixMessage -Text $resultText -Caption "Reset Results - $modeName")
 
     # Don't pay a second full-share freeze for a WhatIf.
     if (-not $whatIf) {
@@ -1918,4 +1991,14 @@ Add-LogMessage "FSLogix Profile Manager v$appVersion started" "INFO"
 Add-LogMessage "Ready. Enter profile root path(s) and click 'Load Profiles'" "INFO"
 Add-LogMessage "Enable 'Check AD' to detect orphaned profiles (requires AD connectivity)" "INFO"
 
-[void]$form.ShowDialog()
+if (-not $InitializeOnly) {
+    try { [void](Show-FSLogixDialog -Dialog $form) }
+    finally {
+        if ($script:ScanState.PowerShell) {
+            $script:ScanState.Cancelled = $true
+            try { $script:ScanState.PowerShell.Stop() } catch { }
+            On-ScanComplete
+        }
+        $form.Dispose()
+    }
+}

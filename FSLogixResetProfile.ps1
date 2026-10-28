@@ -55,6 +55,21 @@
     Permit retiring a row whose username and SID could not be parsed out of
     the share layout. Off by default.
 
+.PARAMETER Reason
+    Required for live resets. Ticket or explanation recorded in every audit row.
+
+.PARAMETER AuditRoot
+    Optional central audit directory. An unavailable explicit audit root aborts
+    the reset before any container is changed.
+
+.PARAMETER MoveToRetired
+    Move retired files to the root's _retired directory. Default: $true.
+    Pass -MoveToRetired:$false for legacy in-place retirement.
+
+.PARAMETER AllOrNothing
+    Abort or roll back a user's batch when a target cannot be retired. Default:
+    $true, including across multiple Cloud Cache roots.
+
 .EXAMPLE
     # Dry run for one user.
     .\FSLogixResetProfile.ps1 -User vditest1 -WhatIf
@@ -62,7 +77,7 @@
 .EXAMPLE
     # Live: every user whose profile hasn't been touched in 60 days, all
     # containers, with confirmation prompts.
-    .\FSLogixResetProfile.ps1 -LastUsedDays 60
+    .\FSLogixResetProfile.ps1 -LastUsedDays 60 -Reason 'CHG1234'
 
 .EXAMPLE
     # Multi-root: scan both providers as independent shares.
@@ -79,6 +94,7 @@ param(
 
     [string[]]$User,
 
+    [ValidateRange(0, 365000)]
     [int]$LastUsedDays = 0,
 
     [switch]$All,
@@ -90,7 +106,15 @@ param(
 
     [switch]$ListOnly,
 
-    [switch]$Force
+    [switch]$Force,
+
+    [string]$Reason,
+
+    [string]$AuditRoot,
+
+    [switch]$MoveToRetired = $true,
+
+    [switch]$AllOrNothing = $true
 )
 
 $ErrorActionPreference = 'Stop'
@@ -108,18 +132,19 @@ Import-Module $modulePath -Force
 #  Roots + filter sanity
 # --------------------------------------------------------------------------------------------------
 if ($PSCmdlet.ParameterSetName -eq 'Single') {
-    $roots = if ($ProfileRoot -match ';') {
-        $ProfileRoot -split ';' | ForEach-Object { $_.Trim() } | Where-Object { $_ }
-    } else {
-        @($ProfileRoot)
-    }
+    $roots = @($ProfileRoot -split ';' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 } else {
     $roots = @($ProfileRoots | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 }
+$roots = @($roots | Select-Object -Unique)
 
 if ($roots.Count -eq 0) {
     Write-Error "No profile roots specified."
     exit 1
+}
+
+if ($PSBoundParameters.ContainsKey('User') -and @($User | Where-Object { [string]::IsNullOrWhiteSpace($_) }).Count -gt 0) {
+    throw 'User filters must not be blank. Use -All to explicitly select every user.'
 }
 
 # Bare call with no filter: refused. This is the headline safety fix.
@@ -128,8 +153,21 @@ if (-not $User -and $LastUsedDays -le 0 -and -not $All) {
     exit 1
 }
 
+foreach ($root in $roots) {
+    if (-not (Test-Path -LiteralPath $root -PathType Container)) {
+        throw "Profile root is unavailable or is not a directory: $root"
+    }
+}
+
 $isSim = $WhatIfPreference
 $mode  = if ($isSim) { 'WHATIF' } else { 'LIVE' }
+if (-not $isSim -and -not $ListOnly -and [string]::IsNullOrWhiteSpace($Reason)) {
+    throw 'A nonblank -Reason (ticket or explanation) is required for a live reset.'
+}
+if ($PSBoundParameters.ContainsKey('AuditRoot')) {
+    if ([string]::IsNullOrWhiteSpace($AuditRoot)) { throw 'AuditRoot must not be blank.' }
+    Set-FSLogixAuditRoot -Path $AuditRoot
+}
 
 Write-Host "FSLogixResetProfile.ps1 - v0.8.0" -ForegroundColor Cyan
 Write-Host ("ProfileRoot(s): {0}" -f ($roots -join '; '))
@@ -138,18 +176,20 @@ Write-Host ("LastUsedDays : {0}" -f $LastUsedDays)
 Write-Host ("All          : {0}" -f $All.IsPresent)
 Write-Host ("Scope        : {0}" -f $Scope)
 Write-Host ("CheckInUse   : {0}" -f ([bool]$CheckInUse))
+Write-Host ("MoveToRetired: {0}" -f ([bool]$MoveToRetired))
+Write-Host ("AllOrNothing : {0}" -f ([bool]$AllOrNothing))
 Write-Host ("WhatIf       : {0}" -f $isSim)
 Write-Host ""
 
 # --------------------------------------------------------------------------------------------------
 #  Scan + filter
 # --------------------------------------------------------------------------------------------------
-$profiles = @(Get-FSLogixProfiles -ProfileRoots $roots)
+$profiles = Get-FSLogixProfiles -ProfileRoots $roots -ErrorOnIncomplete
 
 # Direct call (not @( ... )) so the module's leading-comma return unwraps
 # cleanly. Wrapping with @() would give a 1-element array containing the
 # real result, which makes .Count always 1 for empty results.
-$filtered = Select-FSLogixProfile -Source $profiles -UserFilter $User -AgeDays $LastUsedDays
+$filtered = Select-FSLogixProfile -Source $profiles -UserFilter $User -ExactPattern -AgeDays $LastUsedDays
 
 if ($null -eq $filtered -or $filtered.Count -eq 0) {
     Write-Output "No profiles matched the filters."
@@ -169,35 +209,25 @@ if ($ListOnly) {
 # --------------------------------------------------------------------------------------------------
 #  Per-batch confirmation (only for live runs; WhatIf never prompts)
 # --------------------------------------------------------------------------------------------------
-if (-not $isSim -and $ConfirmPreference -ne 'None') {
-    $names = @($filtered | ForEach-Object { $_.UserName } | Sort-Object)
-    $displayNames = if ($names.Count -le 5) { $names -join ', ' } else {
-        ($names[0..4] -join ', ') + " (+$($names.Count - 5) more)"
-    }
-    $message = "Retire profiles for:`n$displayNames`n`nScope: $Scope`nIn-use check: $CheckInUse`n`nProceed?"
-    $yes = New-Object System.Management.Automation.Host.ChoiceDescription '&Yes', 'Perform the rename.'
-    $no  = New-Object System.Management.Automation.Host.ChoiceDescription '&No',  'Cancel without changes.'
-    $options = [System.Management.Automation.Host.ChoiceDescription[]]($yes, $no)
-    $choice = $host.UI.PromptForChoice("Confirm - $mode", $message, $options, 1)  # 1 = default No
-    if ($choice -ne 0) {
-        Write-Host "Cancelled." -ForegroundColor Yellow
-        exit 0
-    }
+if (-not $isSim -and -not $PSCmdlet.ShouldProcess(($filtered.UserName -join ', '), "Retire profiles (scope=$Scope, checkInUse=$([bool]$CheckInUse))")) {
+    Write-Output 'Cancelled: no changes made.'
+    exit 0
 }
 
 # --------------------------------------------------------------------------------------------------
 #  Execute
 # --------------------------------------------------------------------------------------------------
 $results = @()
-foreach ($profile in $filtered) {
-    if (-not $PSCmdlet.ShouldProcess($profile.UserName, "Retire (scope=$Scope, checkInUse=$([bool]$CheckInUse))")) {
-        continue
-    }
+foreach ($profileRow in $filtered) {
     $r = Rename-FSLogixProfileObject `
-        -ProfileObject $profile `
+        -ProfileObject $profileRow `
         -Scope $Scope `
         -CheckInUse:$CheckInUse `
         -Force:$Force `
+        -Reason $Reason `
+        -MoveToRetired:$MoveToRetired `
+        -AllOrNothing:$AllOrNothing `
+        -WhatIf:$isSim `
         -Confirm:$false
     $results += $r
 }
@@ -242,4 +272,5 @@ if ($totals.AbortedCount -gt 0) {
     foreach ($reason in $totals.AbortReasons) { Write-Output "  $reason" }
 }
 
+if ($totals.Failed -gt 0 -or $totals.AbortedCount -gt 0 -or $totals.Missing -gt 0) { exit 1 }
 exit 0

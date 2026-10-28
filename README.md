@@ -1,258 +1,158 @@
-# FSLogix Profile Manager (Horizon IC) – v0.8.0
+# FSLogix Profile Manager (Horizon IC)
 
-A WinForms PowerShell GUI and a matching CLI for managing FSLogix user profile
-containers in VMware Horizon Instant Clones environments. Retires (renames)
-containers rather than deleting them, so a bad reset is reversible from the
-Retired dialog.
+Windows PowerShell scripts for inspecting and retiring FSLogix profile containers:
+`FSLogixProfileGUI.ps1` is a WinForms application and `FSLogixResetProfile.ps1` is
+a CLI. Both use `FSLogixProfileCore.psm1`. The current development version is 0.8.0.
 
-Containers are stored under UNC paths like:
+Retirement preserves containers with a timestamped `-old-yyyyMMdd-HHmmss` name.
+Only the explicit retired-container purge operation deletes files.
 
-```text
-\\fml-fslogix\FSLogixUserProfiles
-    username_S-1-5-21-XXXXXXXXX-XXXXXXXXX-XXXXXXXXX-XXXXX\*.vhdx
-```
+## Run
 
-Multiple semicolon-separated paths are supported for Cloud Cache setups. Each
-`username_S-1-5-21-...` folder is treated as a single user profile root, and
-all `*.vhd` / `*.vhdx` containers beneath it are discovered and aggregated.
-
-> **v0.8.0 changes**: the GUI and CLI now share a single core module
-> (`FSLogixProfileCore.psm1`). The two diverged copies of scan/filter/retire
-> logic are gone, and the new features (audit, batch restore, retired
-> report, Horizon gate, AD last-logon, move-to-retired) are wired in.
-
----
-
-## Core Features
-
-- Enumerates all `*.vhd` / `*.vhdx` FSLogix containers under one or more root
-  shares.
-- Derives usernames and SIDs from folder names for both FlipFlop orders
-  (`username_SID` and `SID_username`) and from the filename under the
-  `NoProfileContainingFolder` layout.
-- Aggregates multiple containers (Profile, ODFC/Office, extra SIDs) into one
-  row per user.
-- Grid columns: User, # Cont, Size (GB), Max GB, Office GB, Last Write,
-  Status, SIDs, AD Last Logon, Root Folder.
-- **Column sorting** – click headers; sort glyph persists across
-  filter/rescan. Status and SIDs sort by displayed text, not count.
-- **CSV export** – full SIDs, respects column reorder, drops the truncated
-  `(... +N more)` cell.
-- **Filtering:**
-  - Filter by username (substring; brackets escape).
-  - Filter by "Last used > X days" (on-disk mtime).
-  - Filter by "AD last logon > X days" (`lastLogonTimestamp`).
-  - Issues-only filter.
-- **Reset Profile modes:**
-  - **WhatIf (simulate)** – on by default in the GUI (checkbox is
-    pre-checked; the Reset button turns red and reads "Reset Profile -
-    LIVE" the moment you uncheck it). In the CLI, pass `-WhatIf`
-    explicitly — there is no auto-WhatIf, and a bare CLI call with no
-    filter is refused outright (see Safety contract below).
-  - **Only ODFC (Office)** / **Only Profile** checkboxes map to `-Scope
-    Office` / `-Scope Profile` in the module.
-  - Reset all containers (Profile + Office) when both toggles are off.
-  - **Move to retired** (default on): retired files land under
-    `<root>\_retired\<user>\<batch-stamp>\` so they stop counting against
-    the user's FSRM quota and fall outside the user's ACL scope. Turn off
-    to fall back to the legacy in-place rename.
-- **Rename preview** – LIVE / SIMULATION banner at the top with operator,
-  user count, scope, in-use check status, and Horizon connection state.
-  The default action on the preview is Cancel, not Proceed.
-- **Reason / Ticket** – required text box for any live run. The reason
-  is written to the audit log on every renamed row.
-- **In-use detection** – "Skip in-use" is on by default. The tool tries
-  `Get-SmbOpenFile` first (names the holder); falls back to a local lock
-  probe.
-  > Open-handle detection is best-effort. A `ReadWrite` mount on a
-  > different file server, a Cloud Cache session, or a long-lived
-  > `OpenRead` lease can all show a container as "free" when it isn't.
-  > The InUse result is a strong signal; the Free result is a weak one.
-- **Health monitoring:**
-  - Status column: OK, CORRUPT, BAD_SIGNATURE, ORPHAN, AD_DISABLED,
-    NEAR_LIMIT, OVER_LIMIT, EMPTY, HAS_RETIRED, UNPARSED_NAME.
-  - Row colouring: corrupt/orphan/near-limit use theme-aware colours
-    (dark variants for the Dark theme, not the original hard-coded
-    `LightCoral`).
-  - Disk space monitoring with Size (GB) / Max GB columns. Max GB is
-    blank unless Get-VHD or the registry's `SizeInMBs` is available.
-  - Orphan detection via ADSI (no AD module needed). Binds by SID first,
-    falls back to an escaped `sAMAccountName` filter.
-- **Theming** – Light / Dark mode toggle. Health colours re-theme.
-- **Embedded log panel** – resizable; `MaxLength = 0` so it no longer
-  silently dies at ~32 KB.
-- **Row highlighting** – configurable threshold for Size (GB). Health
-  issues win over the size highlight, so a CORRUPT row stays coral even
-  under a low threshold.
-- **Logging** – per-user log files in `%TEMP%` (pattern:
-  `FSLogix_Rename_<user>_<WHATIF|LIVE>_<stamp>.log`).
-- **Audit trail** – monthly append-only CSV under the configured root
-  (default `%ProgramData%\FSLogixProfileManager\Audit`). If a central
-  root was set explicitly via Settings, a failed write aborts the
-  operation.
-- **Retired dialog** – lists every retired container under the configured
-  roots, with an age filter, batch Restore and gated Purge (90-day
-  retention floor, refuses a last copy without `-AllowLastCopy`, refuses
-  legacy undated `-old` without `-IncludeUndated`).
-- **Background scan** – runs in a runspace; the UI shows a marquee
-  progress form with a Cancel button. No more "Not Responding".
-
----
-
-## Requirements
-
-- Windows OS with PowerShell 5.1+.
-- .NET Windows Forms assemblies (standard on Windows).
-- Access to your FSLogix profile share (e.g.
-  `\\fml-fslogix\FSLogixUserProfiles`).
-- Launch PowerShell in **STA** mode for the GUI.
-
----
-
-## Getting Started
-
-1. Copy the scripts to a machine with network access to your FSLogix share.
-2. Open an elevated PowerShell session (recommended for rename/reset
-   operations).
-3. Run the GUI in STA mode:
-
-   ```powershell
-   powershell.exe -STA -ExecutionPolicy Bypass -File .\FSLogixProfileGUI.ps1
-   ```
-
-4. In the GUI:
-   - Verify the **Profile Root** path (defaults to
-     `\\fml-fslogix\FSLogixUserProfiles`).
-   - Click **Load Profiles**.
-   - Use **Filter (user)**, **Older than** and **AD last logon** as
-     needed.
-   - **WhatIf** is on by default. Type a **Reason / Ticket** before
-     unchecking it.
-   - Use the **Horizon...** button to connect to a Connection Server
-     (optional).
-   - Use the **Retired...** button to inspect and restore/purge retired
-     containers.
-   - Use the **Set...** button to point the audit trail at a central
-     share.
-
----
-
-## Resetting (Renaming) Profiles Safely
-
-### WhatIf Mode
-
-- When **WhatIf** is checked, no files are renamed. The run is logged
-  with `[WHATIF] Summary` and no audit row is written.
-- Read the per-user log in `%TEMP%` to review the plan.
-
-### Reset ODFC (Office) only
-
-- Check **Only ODFC** to target only the Office container for the
-  selected users.
-
-### Reset main Profile only
-
-- Check **Only Profile** to target only the Profile container
-  (`Class -eq 'Profile'`). This excludes both Office and Unknown
-  containers — different from the old `-notmatch 'odfc|office'` rule.
-
-### Reset all containers
-
-- Leave both checkboxes unchecked to rename every container for the
-  selected users.
-
-### Live run contract
-
-- A **Reason / Ticket** is required.
-- The Reset button reads **Reset Profile - LIVE** in red whenever
-  WhatIf is off.
-- The preview dialog is modal. **Cancel** is the AcceptButton — a
-  stray Enter never retires anything. The proportionate confirmation
-  that follows it requires the operator to type the container count
-  when the selection is large.
-- A second full-share freeze never happens after a WhatIf run.
-- An audit row is written for every action. A failed write aborts the
-  operation when a central audit root was set.
-
----
-
-## Row Highlighting
-
-- **Highlight >** uses the Size (GB) column. Any user whose Size (GB)
-  is at or above the threshold is highlighted with the theme's
-  highlight colour.
-- **Health wins over size.** A row with `CORRUPT`, `BAD_SIGNATURE`,
-  `ORPHAN`, `AD_DISABLED`, `NEAR_LIMIT` or `OVER_LIMIT` is coloured by
-  the health tier before the size threshold is checked, and stays that
-  colour even when the size highlight is disabled.
-
----
-
-## FSLogix Reset Profile CLI
-
-The CLI (`FSLogixResetProfile.ps1`) is a thin shell over the same module
-the GUI uses. It does not have its own copies of scan/filter/retire
-logic.
-
-### Safety contract
-
-- A bare call with no filter is **refused outright**. Specify
-  `-User`, `-LastUsedDays`, or an explicit `-All`.
-- A live run uses `SupportsShouldProcess`; pass `-WhatIf` to
-  simulate. The CLI does **not** default to WhatIf — a call with no
-  `-WhatIf` and no `-Confirm:$false` will prompt.
-- In-use checking is on by default. Pass `-CheckInUse:$false` to
-  disable (and accept the risk).
-- `-Force` allows retiring a row whose identity could not be parsed
-  out of the share layout.
-
-### Usage Examples
+Requires Windows and Windows PowerShell 5.1, access to the selected profile
+roots, and permission to perform the chosen operation. Start the GUI in STA:
 
 ```powershell
-# Dry run for one user.
-.\FSLogixResetProfile.ps1 -User vditest1 -WhatIf
-
-# Live: every user whose profile hasn't been touched in 60 days.
-.\FSLogixResetProfile.ps1 -LastUsedDays 60
-
-# Multi-root: scan both providers as independent shares.
-.\FSLogixResetProfile.ps1 -ProfileRoots '\\fs1\Profiles','\\fs2\Profiles' -User vdi* -WhatIf
-
-# Live: Office containers only for vdi* users, opt out of in-use check.
-.\FSLogixResetProfile.ps1 -User 'vdi*' -Scope Office -CheckInUse:$false
-
-# List targets only (no reset), for double-checking.
-.\FSLogixResetProfile.ps1 -User vdi* -LastUsedDays 60 -ListOnly
+powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File .\FSLogixProfileGUI.ps1
 ```
 
-### Breaking changes vs the v1 CLI
+Set **Profile Root** before loading; the historical default is
+`\\fml-fslogix\FSLogixUserProfiles`. Separate roots with semicolons.
+The GUI starts in **WhatIf** mode. Select rows deliberately, review the preview,
+and supply **Reason / Ticket** before a live reset.
 
-- The custom `-WhatIf` switch is gone; use the standard one.
-- `-OnlyOdfc` and `-OnlyProfile` are gone; use `-Scope Office` /
-  `-Scope Profile`.
-- A bare call with no filter now exits with an error.
-- In-use checking is now on by default. The v1 CLI never checked
-  at all. Pass `-CheckInUse:$false` to fall back to the old
-  (unsafe) behaviour.
+## Discovery and inspection
 
----
+- Discovers `.vhd` and `.vhdx` files recursively; excludes Cloud Cache sidecars,
+  superseded files, and the managed `_retired` tree from active-profile scans.
+- Recognizes `SID_username` and `username_SID` directories and standard
+  `Profile_username`, `ODFC_username`, and `O365_username` flat filenames.
+- Groups by SID when present, otherwise by parsed username. Two SIDs with the
+  same username remain separate rows; it does **not** merge extra SIDs into one
+  user. Profile and Office containers for the same identity share a row.
+- Grid shows user, container count, on-disk size, maximum size when known,
+  Office size, last write, health, SIDs, AD last logon, and root folder.
+- Supports column sorting, retained sort order across filtering/rescanning,
+  column reordering, CSV export with full SID values, literal substring username
+  filtering, on-disk age, AD last-logon age, and issues-only filtering.
+- Light/Dark themes, health-priority row highlighting, size highlighting, a
+  resizable log panel, and cancellable background discovery.
 
-## Known Assumptions / Limitations
+Both entry points refuse incomplete scans. The GUI disables Reset after root
+edits, a cancelled scan, or a scan error until a complete scan succeeds.
 
-- Username detection works for folder names of the forms
-  `username_SID` and `SID_username`, plus the
-  `NoProfileContainingFolder` layout. Adjust the regexes in
-  `FSLogixProfileCore.psm1` for other naming schemes.
-- The tool assumes relevant FSLogix containers are `.vhd` or `.vhdx`.
-- Open-handle detection can have false negatives on network shares.
-- AD queries can fail on a host that is not domain-joined; orphan
-  detection is then disabled (rows render as `UNKNOWN`).
+**Size (GB)** is the container file's size on disk, not used space inside its
+filesystem. `EMPTY` means the file is smaller than 0.001 GB. `CORRUPT` is an
+administrator-supplied filename marker, not a complete corruption diagnosis.
+Signature checks detect basic VHD/VHDX header/footer problems only.
 
----
+Normal GUI/CLI scans do not request VHD metadata or load registry policy, so
+**Max GB is normally blank**, and signature/near-limit checks are not performed
+by those scans. Module callers can opt in with `Get-FSLogixProfiles
+-ReadVhdMetadata`, `-ConfiguredMaxSizeGB`, and `-ConfiguredOfficeMaxSizeGB`.
+`Get-FSLogixSettings` reads local/remote registry policy as a module API; neither
+entry point automatically applies it.
 
-## Version
+**Check AD** uses ADSI without the AD PowerShell module. Unknown/failed AD
+lookups must not be interpreted as orphans or stale accounts. The AD age filter
+excludes unknown dates. `lastLogonTimestamp` is replicated and approximate.
 
-- **FSLogix Profile Manager (Horizon IC) – v0.8.0**
+## Retirement and recovery
 
-See `CHANGELOG.md` for the full history. The audit backlog lives in
-`BACKLOG.md`.
+- **WhatIf** logs and reports planned actions without moving containers or
+  appending audit action rows. It can create per-user diagnostic logs in `%TEMP%`.
+- Scope is All, Office (`ODFC`/`O365`), or Profile; unknown filenames are included
+  only by All. The GUI's Office and Profile checkboxes are mutually exclusive.
+- **Skip in-use** defaults on. SMB open-handle lookup is attempted where possible,
+  otherwise a local exclusive-open probe is used. These are best-effort checks:
+  a free provider file does not prove a Cloud Cache user is logged off.
+- Live GUI runs require a reason, preview/confirmation, and deliberate selection.
+  The preview defaults to Cancel; large selections require a typed count.
+- **Move to retired** defaults on in both entry points. Files move to
+  `<root>\_retired\<user>\<stamp>\` with `.restore.json` sidecars recording the
+  original relative paths. Keep those sidecars with the files. The tool does
+  **not** configure ACLs or FSRM quotas: protect `_retired` and the audit directory
+  with operator-only permissions, and configure quotas yourself.
+- Per-identity retirement uses all-or-nothing preflight/rollback in the GUI and
+  by default in the CLI. This is best-effort rollback, not a distributed storage
+  transaction; a rollback failure requires manual recovery and is reported.
+- The **Retired...** dialog reports retired files separately, restores selected
+  batches, and offers explicitly confirmed purge. Restore verifies signatures,
+  checks locks, and preserves an existing live sibling as `-superseded-<stamp>`.
+  Managed files with missing/invalid restore metadata require manual recovery.
+- Purge rechecks the file, retirement date and live sibling at execution time.
+  The retention floor defaults to 90 days. Last-copy deletion requires
+  `-AllowLastCopy`; undated legacy `-old` files require `-IncludeUndated`.
+  The dialog requests explicit confirmation for these exceptions.
+
+Audit CSVs are appended monthly under
+`%ProgramData%\FSLogixProfileManager\Audit`, or the root selected via **Set...** /
+CLI `-AuditRoot`. Explicit audit-root write failure aborts before mutation;
+subsequent critical audit failure triggers rollback for retirement/restore.
+Audit rows distinguish intent (`STARTED`), completion, failure, and rollback.
+CSV append behavior alone does not enforce immutable or tamper-proof storage.
+The default local audit root is best-effort and can fail with a warning.
+
+**Horizon...** connects to an optional Connection Server. When connected, GUI
+retirement requires the session check; both connected and disconnected sessions
+block it, and a failed query aborts. There is no automatic logoff/reset-clone
+workflow. Module callers can use `-RequireHorizonCheck` explicitly. The CLI has
+no Horizon connection parameters. REST endpoint compatibility with your Horizon
+build must be checked in a lab before use. Certificate bypass is a lab option
+scoped to requests for that connection.
+
+## CLI
+
+A bare invocation is refused. Specify `-User`, positive `-LastUsedDays`, or
+explicit `-All`. CLI `-User` values are PowerShell wildcard patterns (unlike the
+GUI's literal substring field). Live mode requires `-Reason` and prompts unless
+`-Confirm:$false` is supplied. **CLI does not default to WhatIf.**
+
+```powershell
+# Safe plan for one user; writes a diagnostic log, no container changes.
+.\FSLogixResetProfile.ps1 -ProfileRoot 'D:\LabProfiles' -User alice -WhatIf
+
+# Inspect wildcard matches without resetting.
+.\FSLogixResetProfile.ps1 -ProfileRoot 'D:\LabProfiles' -User 'vdi*' -LastUsedDays 60 -ListOnly
+
+# Live Office retirement, with confirmation and central audit.
+.\FSLogixResetProfile.ps1 -ProfileRoot '\\fs1\Profiles' -User alice -Scope Office -Reason 'CHG1234' -AuditRoot '\\fs1\Operations\Audit'
+
+# Multiple roots are scanned as independent shares, with batch preflight/rollback.
+.\FSLogixResetProfile.ps1 -ProfileRoots '\\fs1\Profiles','\\fs2\Profiles' -User 'vdi*' -WhatIf
+```
+
+`-CheckInUse:$false` disables lock checking. `-Force` permits unresolved
+identities; it does not bypass locks or auditing. `-MoveToRetired:$false` uses
+in-place timestamped retirement. `-AllOrNothing:$false` permits partial batches.
+Failures, missing targets, and aborted batches return a nonzero exit code;
+zero matches and an operator-cancelled confirmation return zero.
+
+Multiple roots alone do not enable Cloud Cache de-duplication. That is available
+only through `Get-FSLogixProfiles -CloudCacheMode` in the module. The module
+retirement plan includes every recorded physical replica. Neither GUI nor CLI
+has a Cloud Cache mode selector, and provider/session behavior is not validated
+against a live Cloud Cache deployment.
+
+## Tests and verification limits
+
+```powershell
+powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File .\tests\Invoke-Tests.ps1
+```
+
+This runner parses the PowerShell sources, runs each suite in a separate
+Windows PowerShell 5.1 STA process, enforces a per-suite timeout, and fails on
+any failed suite. No Pester, browser, AD, Hyper-V, or network share is needed.
+The GUI tests instantiate actual WinForms controls, run modal dialogs with a
+message loop, and exercise the scan runspace against synthetic local files.
+CLI tests launch real child processes and inspect filesystem results.
+
+See [verification coverage and remaining lab checks](docs/VERIFICATION.md).
+Local fixtures and stubbed service responses do **not** establish end-to-end
+compatibility with production SMB, AD, Horizon, Hyper-V, or Cloud Cache.
+
+GitHub Actions runs the same Windows suite on pushes and pull requests and
+uploads a portable script bundle only after tests pass. This is a CI artifact,
+not an installer or deployment. No automatic redeployment is configured.
+
+See [CHANGELOG.md](CHANGELOG.md) and [BACKLOG.md](BACKLOG.md).
